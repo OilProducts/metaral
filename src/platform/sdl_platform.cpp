@@ -194,6 +194,7 @@ struct LoopState {
     bool key_d = false;
     bool key_space = false;
     bool key_shift = false;
+    bool key_tab_pressed = false;
     bool mouse_right_button = false;
     float mouse_dx = 0.0f;
     float mouse_dy = 0.0f;
@@ -237,6 +238,11 @@ void handle_event(const Event& event, LoopState& state) {
         case SDLK_RSHIFT:
             state.key_shift = true;
             break;
+        case SDLK_TAB:
+            if (!event.key.repeat) {
+                state.key_tab_pressed = true;
+            }
+            break;
         default:
             break;
         }
@@ -268,6 +274,8 @@ void handle_event(const Event& event, LoopState& state) {
         case SDLK_LSHIFT:
         case SDLK_RSHIFT:
             state.key_shift = false;
+            break;
+        case SDLK_TAB:
             break;
         default:
             break;
@@ -326,6 +334,7 @@ int run_app(IApp& app, const WindowConfig& cfg) {
         state.quit_requested = false;
         state.mouse_dx = 0.0f;
         state.mouse_dy = 0.0f;
+        state.key_tab_pressed = false;
 
         Event event;
         while (platform.poll_event(event)) {
@@ -346,6 +355,7 @@ int run_app(IApp& app, const WindowConfig& cfg) {
         frame_input.key_d = state.key_d;
         frame_input.key_space = state.key_space;
         frame_input.key_shift = state.key_shift;
+        frame_input.key_tab_pressed = state.key_tab_pressed;
         frame_input.mouse_right_button = state.mouse_right_button;
         frame_input.mouse_delta_x = state.mouse_dx;
         frame_input.mouse_delta_y = state.mouse_dy;
