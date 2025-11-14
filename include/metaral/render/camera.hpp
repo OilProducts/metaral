@@ -2,7 +2,7 @@
 
 #include "metaral/core/coords.hpp"
 
-#include <cmath>
+#include <numbers>
 
 namespace metaral::render {
 
@@ -10,7 +10,7 @@ struct Camera {
     core::PlanetPosition position{};
     core::PlanetPosition forward{};
     core::PlanetPosition up{};
-    float fov_y_radians = 60.0f * static_cast<float>(M_PI) / 180.0f;
+    float fov_y_radians = std::numbers::pi_v<float> / 3.0f; // 60 degrees
 };
 
 struct OrbitParameters {
