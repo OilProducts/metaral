@@ -30,12 +30,13 @@ struct PlanetPosition {
 };
 
 struct CoordinateConfig {
-    float voxel_size_m = 0.1f;
-    int32_t chunk_size = 32;
+    float voxel_size_m = 0.1f;      // meters per voxel edge
+    int32_t chunk_size = 32;        // voxels per chunk edge
     float planet_radius_m = 1000.0f;
-    WorldVoxelCoord planet_center_offset_voxels{};
+    WorldVoxelCoord planet_center_offset_voxels{}; // where (0,0,0) planet space sits in world voxels
 };
 
+// Chunk + local to world voxel (signed, can be negative)
 inline WorldVoxelCoord to_world_voxel(ChunkCoord chunk, LocalVoxelCoord local, const CoordinateConfig& cfg) noexcept {
     const int64_t cs = cfg.chunk_size;
     return {
@@ -46,12 +47,12 @@ inline WorldVoxelCoord to_world_voxel(ChunkCoord chunk, LocalVoxelCoord local, c
 }
 
 inline PlanetPosition to_planet_position(const WorldVoxelCoord& voxel, const CoordinateConfig& cfg) noexcept {
-    int64_t vx = voxel.x - cfg.planet_center_offset_voxels.x;
-    int64_t vy = voxel.y - cfg.planet_center_offset_voxels.y;
-    int64_t vz = voxel.z - cfg.planet_center_offset_voxels.z;
+    const int64_t vx = voxel.x - cfg.planet_center_offset_voxels.x;
+    const int64_t vy = voxel.y - cfg.planet_center_offset_voxels.y;
+    const int64_t vz = voxel.z - cfg.planet_center_offset_voxels.z;
 
     const float scale = cfg.voxel_size_m;
-    constexpr float half = 0.5f;
+    constexpr float half = 0.5f; // center of the voxel
     return {
         (static_cast<float>(vx) + half) * scale,
         (static_cast<float>(vy) + half) * scale,
@@ -77,7 +78,7 @@ inline float height_above_surface(const PlanetPosition& pos, const CoordinateCon
 }
 
 inline PlanetPosition surface_normal(const PlanetPosition& pos) noexcept {
-    float len = length(pos);
+    const float len = length(pos);
     if (len < 1e-6f) {
         return {0.0f, 1.0f, 0.0f};
     }

@@ -1,8 +1,15 @@
-add_library(metaral_world INTERFACE)
+add_library(metaral_world
+    world.cpp
+)
+
+set_target_properties(metaral_world PROPERTIES
+    CXX_STANDARD 20
+    CXX_STANDARD_REQUIRED ON
+)
 
 target_link_libraries(metaral_world
-    INTERFACE
+    PUBLIC
         metaral_core
 )
 
-target_include_directories(metaral_world INTERFACE ${PROJECT_SOURCE_DIR}/include)
+target_include_directories(metaral_world PUBLIC ${PROJECT_SOURCE_DIR}/include)
