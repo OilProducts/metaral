@@ -74,6 +74,7 @@ struct AppInitContext {
     VulkanContext vulkan;
     int window_width = 0;
     int window_height = 0;
+    void* native_window = nullptr; // backend-specific handle (SDL_Window*)
 };
 
 class IApp {
@@ -106,6 +107,7 @@ public:
 
     [[nodiscard]] int width() const noexcept;
     [[nodiscard]] int height() const noexcept;
+    [[nodiscard]] void* native_window_handle() const noexcept;
 
 private:
     struct Impl;

@@ -156,6 +156,10 @@ int SdlPlatform::height() const noexcept {
     return impl_->config.height;
 }
 
+void* SdlPlatform::native_window_handle() const noexcept {
+    return impl_->window;
+}
+
 } // namespace metaral::platform
 
 namespace metaral::platform {
@@ -217,6 +221,7 @@ int run_app(IApp& app, const WindowConfig& cfg) {
         .vulkan = vulkan_context,
         .window_width = state.window_width,
         .window_height = state.window_height,
+        .native_window = platform.native_window_handle(),
     };
 
     app.on_init(init_ctx);

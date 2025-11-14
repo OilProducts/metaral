@@ -1,5 +1,6 @@
 add_library(metaral_render
     camera.cpp
+    raymarch.cpp
 )
 
 set_target_properties(metaral_render PROPERTIES
