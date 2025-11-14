@@ -29,31 +29,178 @@ metaral-engine/
   README.md
 ````
 
-### `core/` – Foundations & Shared Infrastructure
+---
+
+### `core/` – Foundations, Math & Coordinate Spaces
 
 Low-level building blocks that everything else leans on:
 
 * **Math & geometry**
 
   * Vector/matrix types (or wrappers over glm)
-  * Transform utilities (local ↔ world ↔ planetary coordinates)
-  * Noise, interpolation, random utilities
+  * Basic transforms, interpolation, noise, and random utilities
+* **Coordinate space definitions**
+
+  * Type-safe structs or aliases for the different spaces:
+
+    * `LocalVoxelCoord`   (u8/u16 per axis, inside a chunk)
+    * `ChunkCoord`        (int32 per axis)
+    * `WorldVoxelCoord`   (int32 per axis, global voxel index)
+    * `PlanetPosition`    (float3 in meters, origin at planet center)
+    * `RenderPosition`    (float3 in meters, camera-relative)
 * **Config & diagnostics**
 
-  * Engine-wide configuration structs
+  * Engine-wide config (`voxel_size_m`, `chunk_size`, `planet_radius_m`, etc.)
   * Logging, assertions, profiling hooks
-* **Data structures**
+* **Shared data structures**
 
-  * Small allocators/pools used by chunk storage and simulation grids
-  * Generic grids / sparse structures shared by `world/` and `sim/`
+  * Grids, small fixed-size arrays, pools used by `world/` and `sim/`
+  * Generic grids / sparse structures shared across modules
 
-> Think: no game logic here. Just the “standard library” of Metaral Engine.
+> Think: no game logic here. Just the “standard library” of Metaral Engine, with coordinate spaces explicit and hard to mix up—you should never quietly add a `ChunkCoord` to a `PlanetPosition` without an obvious conversion.
+
+Example (conceptual API):
+
+```cpp
+namespace metaral::core {
+
+struct LocalVoxelCoord  { uint8_t x, y, z; };   // [0, chunk_size)
+struct ChunkCoord       { int32_t x, y, z; };   // chunk index in the grid
+struct WorldVoxelCoord  { int32_t x, y, z; };   // global voxel index
+struct PlanetPosition   { float x, y, z; };     // meters, origin at planet center
+
+struct CoordinateConfig {
+    float   voxel_size_m;      // e.g. 0.10 m per voxel
+    int32_t chunk_size;        // e.g. 32 or 64 voxels per side
+    float   planet_radius_m;   // base radius of the planet
+    // derived fields like planet radius in voxels can be cached here
+};
+
+} // namespace metaral::core
+```
 
 ---
 
-### `world/` – Planetary Voxel Topology & Data
+### `world/` – Planetary Voxel Topology, Data & Coordinate Transforms
 
-Everything about **how the planet is stored and addressed**:
+Everything about **how the planet is stored, chunked, and how you move between spaces**.
+
+#### Coordinate Spaces Overview
+
+Metaral uses a simple, hierarchical set of spaces:
+
+1. **Local space (`LocalVoxelCoord`)**
+
+    * Integer coordinates inside a chunk: `[0, chunk_size)` per axis.
+    * Origin at one corner of the chunk.
+    * Cheap to store; used heavily in tight loops.
+
+2. **Chunk space (`ChunkCoord`)**
+
+    * Integer chunk indices in a 3D grid.
+    * `(0,0,0)` is an arbitrary reference chunk near the planet’s center.
+    * Each chunk covers `chunk_size³` voxels.
+
+3. **World voxel space (`WorldVoxelCoord`)**
+
+    * Integer index for every voxel in the world grid.
+    * Derived from chunk + local coordinates.
+    * Conceptually infinite, but practically bounded by the planet and LOD scheme.
+
+4. **Planetary space (`PlanetPosition`)**
+
+    * Continuous 3D position in **meters**, origin at planet center.
+    * Used for physics-ish math, simulation, and raymarching.
+    * From here you can easily derive radius, surface normal, and height above/below the reference radius.
+
+5. **Render / camera space (`RenderPosition`)**
+
+    * Planetary position transformed into camera-relative space for rendering.
+    * `render_pos = view_matrix * planet_pos4`.
+
+#### Core Transform Relationships
+
+1. **Local → World voxel**
+
+```cpp
+WorldVoxelCoord world_voxel(ChunkCoord C, LocalVoxelCoord L, int chunk_size) {
+    return {
+        C.x * chunk_size + L.x,
+        C.y * chunk_size + L.y,
+        C.z * chunk_size + L.z
+    };
+}
+```
+
+This is purely integer math: “which voxel in the global grid is this?”
+
+2. **World voxel → Planetary**
+
+We define:
+
+* `voxel_size_m`  – how many meters each voxel edge represents.
+* `planet_center_offset_voxels` – where the planet center sits in world-voxel space, so that the sphere is roughly centered in the grid.
+
+```cpp
+PlanetPosition voxel_center_to_planet(
+    WorldVoxelCoord V,
+    const CoordinateConfig& cfg,
+    const WorldVoxelCoord& planet_center_offset_voxels)
+{
+    // Offset so that (0,0,0) in planetary space is the planet center.
+    int32_t vx = V.x - planet_center_offset_voxels.x;
+    int32_t vy = V.y - planet_center_offset_voxels.y;
+    int32_t vz = V.z - planet_center_offset_voxels.z;
+
+    // Convert from voxel index to meters.
+    float sx = static_cast<float>(vx) * cfg.voxel_size_m;
+    float sy = static_cast<float>(vy) * cfg.voxel_size_m;
+    float sz = static_cast<float>(vz) * cfg.voxel_size_m;
+
+    return { sx, sy, sz };
+}
+```
+
+Think of it as:
+
+> **World voxel → shift so the planet center is at the origin → scale by meters-per-voxel.**
+
+3. **Planetary → World voxel (for lookups)**
+
+```cpp
+WorldVoxelCoord planet_to_world_voxel(
+    PlanetPosition P,
+    const CoordinateConfig& cfg,
+    const WorldVoxelCoord& planet_center_offset_voxels)
+{
+    float inv = 1.0f / cfg.voxel_size_m;
+    int32_t vx = static_cast<int32_t>(std::floor(P.x * inv));
+    int32_t vy = static_cast<int32_t>(std::floor(P.y * inv));
+    int32_t vz = static_cast<int32_t>(std::floor(P.z * inv));
+
+    return {
+        vx + planet_center_offset_voxels.x,
+        vy + planet_center_offset_voxels.y,
+        vz + planet_center_offset_voxels.z
+    };
+}
+```
+
+Lets you determine which voxel(s) a raymarch step hits or “what material lives at this planetary position?”
+
+4. **Planetary height & surface normal**
+
+```cpp
+float r      = std::sqrt(P.x*P.x + P.y*P.y + P.z*P.z);
+float height = r - cfg.planet_radius_m;
+PlanetPosition normal = { P.x / r, P.y / r, P.z / r };
+```
+
+* `height > 0` → above nominal surface
+* `height < 0` → inside the crust/mantle
+* `normal` is the “up” direction for gravity, erosion, camera controls, particles, etc.
+
+#### Data Layout, Chunking & Fields
 
 * **World topology**
 
@@ -75,6 +222,15 @@ Example classes:
 * `metaral::world::Chunk`
 * `metaral::world::PlanetTopology`
 
+#### How This Plays With Chunks & Simulation
+
+* `world/` owns **where data lives** (chunks + voxel indices) and the **integer transforms** between local/chunk/world-voxel.
+* It also exposes helpers to step into `PlanetPosition` and back.
+* `sim/` and `render/` almost never care about `ChunkCoord` or `LocalVoxelCoord` directly:
+
+  * `sim/` consumes “sample at this planetary position” or iterates over ranges of `WorldVoxelCoord`.
+  * `render/` raymarches in planetary space, then calls back into `world/`/`sim/` to sample fields.
+
 ---
 
 ### `sim/` – Material, Thermal & Environmental Simulation
@@ -92,12 +248,10 @@ This is the **“plausible physics” heart** of Metaral Engine.
   * Optional velocity fields for liquids/gases (if doing fluid-ish behavior)
 * **Simulation steps**
 
-  * Discrete timesteps that update material states based on:
-
-    * Neighbor interactions
-    * Energy transfer, cooling/heating
-    * Simple diffusion/convection/advection schemes
+  * Discrete timesteps that update material states based on neighbor interactions, energy transfer, and simple diffusion/convection/advection schemes
   * Hooks for game-level events (player digging, explosions, etc.)
+
+It leans heavily on the transforms defined in `core/` + `world/` to walk chunks efficiently in integer space, while reasoning about gravity wells, surface normals, and heights in planetary space.
 
 Example classes:
 
@@ -116,13 +270,14 @@ All visual output lives here, with a focus on **raymarching over fields derived 
 * **View & camera**
 
   * Camera representation, frustum, projection, view transforms
+  * Planetary position → camera space (`RenderPosition`)
 * **Field extraction**
 
   * Building render-time scalar fields (distance/occupancy) from voxel data
   * Level-of-detail and sampling strategies
 * **Raymarcher**
 
-  * CPU/GPU raymarching core
+  * CPU/GPU raymarching core operating directly in planetary space, sampling the underlying materials/fields
   * Material-based shading (lava glow, steam translucency, etc.)
   * Normal estimation from fields for lighting
 * **Rendering backend integration**
@@ -134,7 +289,7 @@ Example classes:
 
 * `metaral::render::RaymarchRenderer`
 * `metaral::render::Camera`
-* `metaral::render::FrameGraph` (if you go that route)
+* `metaral::render::FrameGraph`
 
 ---
 
@@ -171,7 +326,7 @@ Structured in/out for both gameplay data and dev tooling:
 * **Config & assets**
 
   * Engine config (JSON/TOML/etc.)
-  * Material definition files readers
+  * Material definition file readers
 * **Debug dumps**
 
   * Binary or textual dumps of bricks/chunks for inspection
@@ -223,5 +378,3 @@ Small, focused programs that show **how to embed Metaral Engine**:
 These examples serve as both **developer documentation** and **experimental sandboxes** while the main game (`Metaral: Neventinue`) evolves in its own repo.
 
 ---
-
-
