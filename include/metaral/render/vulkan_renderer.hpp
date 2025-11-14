@@ -8,6 +8,7 @@
 #include <vulkan/vulkan.h>
 #endif
 
+#include <cstdint>
 #include <memory>
 
 namespace metaral::render {
@@ -21,7 +22,6 @@ namespace metaral::render {
 class VulkanRenderer {
 public:
     VulkanRenderer(const platform::VulkanContext& ctx,
-                   VkSurfaceKHR surface,
                    std::uint32_t width,
                    std::uint32_t height);
     ~VulkanRenderer();
@@ -32,13 +32,12 @@ public:
     void resize(std::uint32_t width, std::uint32_t height);
     void draw_frame(const Camera& camera, const world::World& world);
     void wait_idle();
+    struct Impl;
 
 private:
-    struct Impl;
     std::unique_ptr<Impl> impl_;
 };
 
 #endif // METARAL_ENABLE_VULKAN
 
 } // namespace metaral::render
-
