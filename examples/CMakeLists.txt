@@ -16,19 +16,6 @@ target_link_libraries(world_fill
         metaral_world
 )
 
-add_executable(metaral_minimal_viewer
-    minimal_viewer.cpp
-)
-
-target_link_libraries(metaral_minimal_viewer
-    PRIVATE
-        metaral_platform
-        metaral_world
-        metaral_render
-        metaral_core
-        SDL3::SDL3
-)
-
 if(METARAL_ENABLE_VULKAN)
     add_executable(metaral_vulkan_viewer
         vulkan_viewer.cpp

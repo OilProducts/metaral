@@ -95,6 +95,21 @@ bool SdlPlatform::poll_event(Event& out_event) {
             out_event.key.scancode = event.key.scancode;
             out_event.key.repeat = false;
             return true;
+        case SDL_EVENT_MOUSE_MOTION:
+            out_event.type = EventType::MouseMotion;
+            out_event.mouse_motion.dx = event.motion.xrel;
+            out_event.mouse_motion.dy = event.motion.yrel;
+            return true;
+        case SDL_EVENT_MOUSE_BUTTON_DOWN:
+            out_event.type = EventType::MouseButtonDown;
+            out_event.mouse_button.button = event.button.button;
+            out_event.mouse_button.pressed = true;
+            return true;
+        case SDL_EVENT_MOUSE_BUTTON_UP:
+            out_event.type = EventType::MouseButtonUp;
+            out_event.mouse_button.button = event.button.button;
+            out_event.mouse_button.pressed = false;
+            return true;
         default:
             break;
         }
@@ -173,6 +188,15 @@ struct LoopState {
     bool quit_requested = false;
     int window_width = 0;
     int window_height = 0;
+    bool key_w = false;
+    bool key_a = false;
+    bool key_s = false;
+    bool key_d = false;
+    bool key_space = false;
+    bool key_shift = false;
+    bool mouse_right_button = false;
+    float mouse_dx = 0.0f;
+    float mouse_dy = 0.0f;
 };
 
 void handle_event(const Event& event, LoopState& state) {
@@ -186,13 +210,81 @@ void handle_event(const Event& event, LoopState& state) {
         state.resized_this_frame = true;
         break;
     case EventType::KeyDown:
-        if (event.key.keycode == SDLK_ESCAPE) {
+        switch (event.key.keycode) {
+        case SDLK_ESCAPE:
             state.escape_down = true;
+            break;
+        case SDLK_W:
+        case SDLK_UP:
+            state.key_w = true;
+            break;
+        case SDLK_S:
+        case SDLK_DOWN:
+            state.key_s = true;
+            break;
+        case SDLK_A:
+        case SDLK_LEFT:
+            state.key_a = true;
+            break;
+        case SDLK_D:
+        case SDLK_RIGHT:
+            state.key_d = true;
+            break;
+        case SDLK_SPACE:
+            state.key_space = true;
+            break;
+        case SDLK_LSHIFT:
+        case SDLK_RSHIFT:
+            state.key_shift = true;
+            break;
+        default:
+            break;
         }
         break;
     case EventType::KeyUp:
-        if (event.key.keycode == SDLK_ESCAPE) {
+        switch (event.key.keycode) {
+        case SDLK_ESCAPE:
             state.escape_down = false;
+            break;
+        case SDLK_W:
+        case SDLK_UP:
+            state.key_w = false;
+            break;
+        case SDLK_S:
+        case SDLK_DOWN:
+            state.key_s = false;
+            break;
+        case SDLK_A:
+        case SDLK_LEFT:
+            state.key_a = false;
+            break;
+        case SDLK_D:
+        case SDLK_RIGHT:
+            state.key_d = false;
+            break;
+        case SDLK_SPACE:
+            state.key_space = false;
+            break;
+        case SDLK_LSHIFT:
+        case SDLK_RSHIFT:
+            state.key_shift = false;
+            break;
+        default:
+            break;
+        }
+        break;
+    case EventType::MouseMotion:
+        state.mouse_dx += static_cast<float>(event.mouse_motion.dx);
+        state.mouse_dy += static_cast<float>(event.mouse_motion.dy);
+        break;
+    case EventType::MouseButtonDown:
+        if (event.mouse_button.button == SDL_BUTTON_RIGHT) {
+            state.mouse_right_button = true;
+        }
+        break;
+    case EventType::MouseButtonUp:
+        if (event.mouse_button.button == SDL_BUTTON_RIGHT) {
+            state.mouse_right_button = false;
         }
         break;
     default:
@@ -232,6 +324,8 @@ int run_app(IApp& app, const WindowConfig& cfg) {
     while (state.running) {
         state.resized_this_frame = false;
         state.quit_requested = false;
+        state.mouse_dx = 0.0f;
+        state.mouse_dy = 0.0f;
 
         Event event;
         while (platform.poll_event(event)) {
@@ -246,6 +340,15 @@ int run_app(IApp& app, const WindowConfig& cfg) {
         frame_input.quit_requested = state.quit_requested;
         frame_input.key_escape = state.escape_down;
         frame_input.window_resized = state.resized_this_frame;
+        frame_input.key_w = state.key_w;
+        frame_input.key_a = state.key_a;
+        frame_input.key_s = state.key_s;
+        frame_input.key_d = state.key_d;
+        frame_input.key_space = state.key_space;
+        frame_input.key_shift = state.key_shift;
+        frame_input.mouse_right_button = state.mouse_right_button;
+        frame_input.mouse_delta_x = state.mouse_dx;
+        frame_input.mouse_delta_y = state.mouse_dy;
 
         FrameContext frame_ctx{};
         frame_ctx.dt_seconds = dt;

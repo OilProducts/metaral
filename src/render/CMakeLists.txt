@@ -1,6 +1,5 @@
 add_library(metaral_render
     camera.cpp
-    raymarch.cpp
     vulkan_renderer.cpp
 )
 

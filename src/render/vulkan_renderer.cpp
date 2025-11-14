@@ -4,7 +4,9 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -41,11 +43,26 @@ struct VulkanRenderer::Impl {
 
     VkPipelineLayout pipeline_layout = VK_NULL_HANDLE;
     VkPipeline pipeline = VK_NULL_HANDLE;
+
+    VkDescriptorSetLayout descriptor_set_layout = VK_NULL_HANDLE;
+    VkDescriptorPool descriptor_pool = VK_NULL_HANDLE;
+    VkDescriptorSet descriptor_set = VK_NULL_HANDLE;
+
+    VkBuffer sdf_buffer = VK_NULL_HANDLE;
+    VkDeviceMemory sdf_memory = VK_NULL_HANDLE;
+    uint32_t sdf_dim = 0;
+    float sdf_voxel_size = 0.0f;
+    float sdf_radius = 0.0f;
+    float sdf_half_extent = 0.0f;
 };
 
 namespace {
 
 using Impl = VulkanRenderer::Impl;
+
+constexpr float kSdfVoxelSizeMeters = 1.0f;
+constexpr float kNoiseAmplitudeMeters = 2.0f;
+constexpr float kSdfMarginVoxels = 4.0f;
 
 [[noreturn]] void vk_throw(const char* what, VkResult res) {
     throw std::runtime_error(std::string("Vulkan error in ") + what + ": " + std::to_string(res));
@@ -55,6 +72,24 @@ void vk_check(VkResult res, const char* what) {
     if (res != VK_SUCCESS) {
         vk_throw(what, res);
     }
+}
+
+uint32_t find_memory_type(const Impl& impl,
+                          uint32_t type_bits,
+                          VkMemoryPropertyFlags properties) {
+    VkPhysicalDeviceMemoryProperties memory_properties;
+    vkGetPhysicalDeviceMemoryProperties(impl.physical_device, &memory_properties);
+
+    for (uint32_t index = 0; index < memory_properties.memoryTypeCount; ++index) {
+        const bool supported = (type_bits & (1u << index)) != 0;
+        const bool has_flags =
+            (memory_properties.memoryTypes[index].propertyFlags & properties) == properties;
+        if (supported && has_flags) {
+            return index;
+        }
+    }
+
+    vk_throw("find_memory_type", VK_ERROR_FEATURE_NOT_PRESENT);
 }
 
 bool supports_presentation(VkPhysicalDevice device,
@@ -308,14 +343,33 @@ VkShaderModule create_shader_module(VkDevice device, const char* path) {
 }
 
 void create_pipeline(Impl& impl) {
+    VkDescriptorSetLayoutBinding sdf_binding{};
+    sdf_binding.binding = 0;
+    sdf_binding.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    sdf_binding.descriptorCount = 1;
+    sdf_binding.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+
+    VkDescriptorSetLayoutCreateInfo set_layout_info{};
+    set_layout_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+    set_layout_info.bindingCount = 1;
+    set_layout_info.pBindings = &sdf_binding;
+
+    vk_check(vkCreateDescriptorSetLayout(impl.device,
+                                         &set_layout_info,
+                                         nullptr,
+                                         &impl.descriptor_set_layout),
+             "vkCreateDescriptorSetLayout");
+
     // Push constant block layout: CameraParams
     VkPushConstantRange range{};
     range.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
     range.offset = 0;
-    range.size = sizeof(float) * 4 * 4; // 4 vec4s
+    range.size = sizeof(float) * 4 * 5; // 5 vec4s
 
     VkPipelineLayoutCreateInfo layout_info{};
     layout_info.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    layout_info.setLayoutCount = 1;
+    layout_info.pSetLayouts = &impl.descriptor_set_layout;
     layout_info.pushConstantRangeCount = 1;
     layout_info.pPushConstantRanges = &range;
 
@@ -399,6 +453,155 @@ void create_pipeline(Impl& impl) {
 
     vkDestroyShaderModule(impl.device, vert, nullptr);
     vkDestroyShaderModule(impl.device, frag, nullptr);
+}
+
+void ensure_sdf_grid(Impl& impl, float planet_radius) {
+    if (impl.sdf_dim != 0 &&
+        impl.sdf_radius == planet_radius &&
+        impl.sdf_voxel_size == kSdfVoxelSizeMeters) {
+        return;
+    }
+
+    if (impl.device == VK_NULL_HANDLE) {
+        return;
+    }
+
+    if (impl.sdf_buffer != VK_NULL_HANDLE) {
+        vkDestroyBuffer(impl.device, impl.sdf_buffer, nullptr);
+        impl.sdf_buffer = VK_NULL_HANDLE;
+    }
+    if (impl.sdf_memory != VK_NULL_HANDLE) {
+        vkFreeMemory(impl.device, impl.sdf_memory, nullptr);
+        impl.sdf_memory = VK_NULL_HANDLE;
+    }
+
+    const float voxel_size = kSdfVoxelSizeMeters;
+
+    // Expand the SDF grid so that the noisy, raymarched
+    // surface stays well inside the valid sampling region.
+    const float half_extent =
+        planet_radius + kNoiseAmplitudeMeters + kSdfMarginVoxels * voxel_size;
+
+    const float diameter = half_extent * 2.0f;
+    const uint32_t dim = static_cast<uint32_t>(std::ceil(diameter / voxel_size));
+    const std::size_t cell_count = static_cast<std::size_t>(dim) * dim * dim;
+
+    std::vector<float> sdf_values(cell_count);
+
+    const float grid_min = -half_extent;
+
+    auto linear_index = [dim](uint32_t x_index,
+                              uint32_t y_index,
+                              uint32_t z_index) -> std::size_t {
+        return (static_cast<std::size_t>(z_index) * dim +
+                static_cast<std::size_t>(y_index)) *
+                   dim +
+               static_cast<std::size_t>(x_index);
+    };
+
+    for (uint32_t z_index = 0; z_index < dim; ++z_index) {
+        for (uint32_t y_index = 0; y_index < dim; ++y_index) {
+            for (uint32_t x_index = 0; x_index < dim; ++x_index) {
+                float x = grid_min + (static_cast<float>(x_index) + 0.5f) * voxel_size;
+                float y = grid_min + (static_cast<float>(y_index) + 0.5f) * voxel_size;
+                float z = grid_min + (static_cast<float>(z_index) + 0.5f) * voxel_size;
+
+                core::PlanetPosition position{x, y, z};
+                float distance = core::length(position) - planet_radius;
+
+                // Add a small, smooth perturbation so the surface
+                // is more visually interesting than a perfect sphere.
+                const float freq = 0.18f;                    // higher frequency features
+                const float amp  = kNoiseAmplitudeMeters;    // meters of displacement
+                float wobble =
+                    std::sin(position.x * freq) *
+                    std::sin(position.y * freq) *
+                    std::sin(position.z * freq);
+
+                distance += wobble * amp;
+
+                sdf_values[linear_index(x_index, y_index, z_index)] = distance;
+            }
+        }
+    }
+
+    VkBufferCreateInfo buffer_info{};
+    buffer_info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+    buffer_info.size = sdf_values.size() * sizeof(float);
+    buffer_info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+    buffer_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+
+    vk_check(vkCreateBuffer(impl.device, &buffer_info, nullptr, &impl.sdf_buffer),
+             "vkCreateBuffer(sdf_buffer)");
+
+    VkMemoryRequirements requirements{};
+    vkGetBufferMemoryRequirements(impl.device, impl.sdf_buffer, &requirements);
+
+    VkMemoryAllocateInfo alloc_info{};
+    alloc_info.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    alloc_info.allocationSize = requirements.size;
+    alloc_info.memoryTypeIndex = find_memory_type(
+        impl,
+        requirements.memoryTypeBits,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+
+    vk_check(vkAllocateMemory(impl.device, &alloc_info, nullptr, &impl.sdf_memory),
+             "vkAllocateMemory(sdf_memory)");
+    vk_check(vkBindBufferMemory(impl.device, impl.sdf_buffer, impl.sdf_memory, 0),
+             "vkBindBufferMemory(sdf_buffer)");
+
+    void* mapped_memory = nullptr;
+    vk_check(vkMapMemory(impl.device, impl.sdf_memory, 0, buffer_info.size, 0, &mapped_memory),
+             "vkMapMemory(sdf_memory)");
+    std::memcpy(mapped_memory, sdf_values.data(), buffer_info.size);
+    vkUnmapMemory(impl.device, impl.sdf_memory);
+
+    impl.sdf_dim = dim;
+    impl.sdf_voxel_size = voxel_size;
+    impl.sdf_radius = planet_radius;
+    impl.sdf_half_extent = half_extent;
+
+    if (impl.descriptor_pool == VK_NULL_HANDLE) {
+        VkDescriptorPoolSize pool_size{};
+        pool_size.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        pool_size.descriptorCount = 1;
+
+        VkDescriptorPoolCreateInfo pool_info{};
+        pool_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+        pool_info.maxSets = 1;
+        pool_info.poolSizeCount = 1;
+        pool_info.pPoolSizes = &pool_size;
+
+        vk_check(vkCreateDescriptorPool(impl.device, &pool_info, nullptr, &impl.descriptor_pool),
+                 "vkCreateDescriptorPool");
+    }
+
+    if (impl.descriptor_set == VK_NULL_HANDLE) {
+        VkDescriptorSetAllocateInfo alloc_set{};
+        alloc_set.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+        alloc_set.descriptorPool = impl.descriptor_pool;
+        alloc_set.descriptorSetCount = 1;
+        alloc_set.pSetLayouts = &impl.descriptor_set_layout;
+
+        vk_check(vkAllocateDescriptorSets(impl.device, &alloc_set, &impl.descriptor_set),
+                 "vkAllocateDescriptorSets");
+    }
+
+    VkDescriptorBufferInfo buffer_info_desc{};
+    buffer_info_desc.buffer = impl.sdf_buffer;
+    buffer_info_desc.offset = 0;
+    buffer_info_desc.range = buffer_info.size;
+
+    VkWriteDescriptorSet write{};
+    write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    write.dstSet = impl.descriptor_set;
+    write.dstBinding = 0;
+    write.dstArrayElement = 0;
+    write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    write.descriptorCount = 1;
+    write.pBufferInfo = &buffer_info_desc;
+
+    vkUpdateDescriptorSets(impl.device, 1, &write, 0, nullptr);
 }
 
 void create_command_pool_and_buffers(Impl& impl) {
@@ -494,6 +697,13 @@ VulkanRenderer::~VulkanRenderer() {
         vkDeviceWaitIdle(impl_->device);
     }
 
+    if (impl_->sdf_buffer != VK_NULL_HANDLE) {
+        vkDestroyBuffer(impl_->device, impl_->sdf_buffer, nullptr);
+    }
+    if (impl_->sdf_memory != VK_NULL_HANDLE) {
+        vkFreeMemory(impl_->device, impl_->sdf_memory, nullptr);
+    }
+
     if (impl_->swapchain != VK_NULL_HANDLE) {
         vkDestroySwapchainKHR(impl_->device, impl_->swapchain, nullptr);
     }
@@ -502,6 +712,12 @@ VulkanRenderer::~VulkanRenderer() {
     }
     if (impl_->pipeline_layout != VK_NULL_HANDLE) {
         vkDestroyPipelineLayout(impl_->device, impl_->pipeline_layout, nullptr);
+    }
+    if (impl_->descriptor_pool != VK_NULL_HANDLE) {
+        vkDestroyDescriptorPool(impl_->device, impl_->descriptor_pool, nullptr);
+    }
+    if (impl_->descriptor_set_layout != VK_NULL_HANDLE) {
+        vkDestroyDescriptorSetLayout(impl_->device, impl_->descriptor_set_layout, nullptr);
     }
     for (auto fb : impl_->framebuffers) {
         vkDestroyFramebuffer(impl_->device, fb, nullptr);
@@ -568,6 +784,10 @@ struct CameraPush {
     float forward[3];     float fovY;
     float right[3];       float aspect;
     float up[3];          float pad1;
+    float gridDim;
+    float gridVoxelSize;
+    float gridHalfExtent;
+    float pad2;
 };
 
 core::PlanetPosition normalize_vec(const core::PlanetPosition& v) {
@@ -608,6 +828,8 @@ void VulkanRenderer::draw_frame(const Camera& camera, const world::World& world)
     }
     vk_check(res, "vkAcquireNextImageKHR");
 
+    ensure_sdf_grid(*impl_, world.coords().planet_radius_m);
+
     // Build push constants for this frame
     core::PlanetPosition fwd = normalize_vec(camera.forward);
     core::PlanetPosition up = normalize_vec(camera.up);
@@ -634,6 +856,9 @@ void VulkanRenderer::draw_frame(const Camera& camera, const world::World& world)
     push.up[0] = up.x;
     push.up[1] = up.y;
     push.up[2] = up.z;
+    push.gridDim = static_cast<float>(impl_->sdf_dim);
+    push.gridVoxelSize = impl_->sdf_voxel_size;
+    push.gridHalfExtent = impl_->sdf_half_extent;
 
     // Record command buffer for this image
     VkCommandBuffer cmd = impl_->command_buffers[image_index];
@@ -657,6 +882,16 @@ void VulkanRenderer::draw_frame(const Camera& camera, const world::World& world)
 
     vkCmdBeginRenderPass(cmd, &rp_info, VK_SUBPASS_CONTENTS_INLINE);
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, impl_->pipeline);
+    if (impl_->descriptor_set != VK_NULL_HANDLE) {
+        vkCmdBindDescriptorSets(cmd,
+                                VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                impl_->pipeline_layout,
+                                0,
+                                1,
+                                &impl_->descriptor_set,
+                                0,
+                                nullptr);
+    }
     vkCmdPushConstants(cmd,
                        impl_->pipeline_layout,
                        VK_SHADER_STAGE_FRAGMENT_BIT,

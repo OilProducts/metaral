@@ -365,9 +365,9 @@ Example targets:
 
 Small, focused programs that show **how to embed Metaral Engine**:
 
-* `examples/minimal_viewer`
+* `examples/vulkan_viewer`
 
-  * Create a window, load a world, render with the raymarcher
+  * Create a window, load a world, render with the Vulkan analytic sphere raymarcher
 * `examples/sim_sandbox`
 
   * Simple UI to spawn materials (lava, water, etc.) and watch them interact

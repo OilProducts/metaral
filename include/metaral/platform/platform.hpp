@@ -23,6 +23,9 @@ enum class EventType {
     WindowResized,
     KeyDown,
     KeyUp,
+    MouseMotion,
+    MouseButtonDown,
+    MouseButtonUp,
 };
 
 struct WindowResizedEvent {
@@ -36,10 +39,22 @@ struct KeyEvent {
     bool repeat = false;
 };
 
+struct MouseMotionEvent {
+    int dx = 0;
+    int dy = 0;
+};
+
+struct MouseButtonEvent {
+    int button = 0;
+    bool pressed = false;
+};
+
 struct Event {
     EventType type = EventType::None;
     WindowResizedEvent window_resized{};
     KeyEvent key{};
+    MouseMotionEvent mouse_motion{};
+    MouseButtonEvent mouse_button{};
 };
 
 struct WindowConfig {
@@ -55,6 +70,15 @@ struct FrameInput {
     bool quit_requested = false;
     bool key_escape = false;
     bool window_resized = false;
+    bool key_w = false;
+    bool key_a = false;
+    bool key_s = false;
+    bool key_d = false;
+    bool key_space = false;
+    bool key_shift = false;
+    bool mouse_right_button = false;
+    float mouse_delta_x = 0.0f;
+    float mouse_delta_y = 0.0f;
 };
 
 struct FrameContext {
