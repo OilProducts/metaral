@@ -59,7 +59,7 @@ void MinimalViewer::on_init(const metaral::platform::AppInitContext& ctx) {
     framebuffer_.resize(kFrameWidth * kFrameHeight);
 
     metaral::render::OrbitParameters orbit{};
-    orbit.altitude_m = 20.0f;
+    orbit.altitude_m = 90.0f;
     orbit.latitude_radians = 0.4f;
     orbit.longitude_radians = 0.6f;
     camera_ = metaral::render::make_orbit_camera(coords_, orbit);

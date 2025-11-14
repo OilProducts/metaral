@@ -8,6 +8,7 @@ set(METARAL_PLATFORM_BACKEND "SDL3" CACHE STRING "Platform backend implementatio
 set_property(CACHE METARAL_PLATFORM_BACKEND PROPERTY STRINGS SDL3)
 
 option(METARAL_BUNDLE_SDL3 "Download/build SDL3 locally if a system package is not found" ON)
+option(METARAL_ENABLE_VULKAN "Enable Vulkan-based GPU renderer" ON)
 
 if(METARAL_PLATFORM_BACKEND STREQUAL "SDL3")
     find_package(SDL3 QUIET CONFIG)
@@ -35,6 +36,14 @@ if(METARAL_PLATFORM_BACKEND STREQUAL "SDL3")
     endif()
 else()
     message(FATAL_ERROR "Unsupported METARAL_PLATFORM_BACKEND: ${METARAL_PLATFORM_BACKEND}")
+endif()
+
+if(METARAL_ENABLE_VULKAN)
+    find_package(Vulkan QUIET)
+    if(NOT Vulkan_FOUND)
+        message(WARNING "Vulkan SDK not found, disabling METARAL_ENABLE_VULKAN")
+        set(METARAL_ENABLE_VULKAN OFF)
+    endif()
 endif()
 
 set(CMAKE_CXX_STANDARD 20)

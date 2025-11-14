@@ -40,7 +40,7 @@ SdlPlatform::SdlPlatform(const WindowConfig& config)
     : impl_(std::make_unique<Impl>()) {
     impl_->config = config;
 
-    if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS) != 0) {
+    if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS)) {
         throw make_sdl_error("SDL_Init");
     }
 
