@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdio>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -37,6 +38,9 @@ struct VulkanRenderer::Impl {
     VkSemaphore image_available = VK_NULL_HANDLE;
     VkSemaphore render_finished = VK_NULL_HANDLE;
     VkFence in_flight = VK_NULL_HANDLE;
+
+    VkPipelineLayout pipeline_layout = VK_NULL_HANDLE;
+    VkPipeline pipeline = VK_NULL_HANDLE;
 };
 
 namespace {
@@ -276,6 +280,127 @@ void create_framebuffers(Impl& impl) {
     }
 }
 
+std::vector<char> read_file(const char* path) {
+    std::FILE* f = std::fopen(path, "rb");
+    if (!f) {
+        throw std::runtime_error(std::string("Failed to open shader file: ") + path);
+    }
+    std::fseek(f, 0, SEEK_END);
+    long size = std::ftell(f);
+    std::fseek(f, 0, SEEK_SET);
+    std::vector<char> data(static_cast<std::size_t>(size));
+    std::fread(data.data(), 1, data.size(), f);
+    std::fclose(f);
+    return data;
+}
+
+VkShaderModule create_shader_module(VkDevice device, const char* path) {
+    std::vector<char> bytes = read_file(path);
+
+    VkShaderModuleCreateInfo info{};
+    info.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+    info.codeSize = bytes.size();
+    info.pCode = reinterpret_cast<const uint32_t*>(bytes.data());
+
+    VkShaderModule module = VK_NULL_HANDLE;
+    vk_check(vkCreateShaderModule(device, &info, nullptr, &module), "vkCreateShaderModule");
+    return module;
+}
+
+void create_pipeline(Impl& impl) {
+    // Push constant block layout: CameraParams
+    VkPushConstantRange range{};
+    range.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    range.offset = 0;
+    range.size = sizeof(float) * 4 * 4; // 4 vec4s
+
+    VkPipelineLayoutCreateInfo layout_info{};
+    layout_info.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    layout_info.pushConstantRangeCount = 1;
+    layout_info.pPushConstantRanges = &range;
+
+    vk_check(vkCreatePipelineLayout(impl.device, &layout_info, nullptr, &impl.pipeline_layout), "vkCreatePipelineLayout");
+
+    VkShaderModule vert = create_shader_module(impl.device, METARAL_SHADER_DIR "/fullscreen_triangle.vert.spv");
+    VkShaderModule frag = create_shader_module(impl.device, METARAL_SHADER_DIR "/analytic_sphere.frag.spv");
+
+    VkPipelineShaderStageCreateInfo stages[2]{};
+    stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+    stages[0].module = vert;
+    stages[0].pName = "main";
+
+    stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+    stages[1].module = frag;
+    stages[1].pName = "main";
+
+    VkPipelineVertexInputStateCreateInfo vi{};
+    vi.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+
+    VkPipelineInputAssemblyStateCreateInfo ia{};
+    ia.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
+    ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+
+    VkViewport viewport{};
+    viewport.x = 0.0f;
+    viewport.y = 0.0f;
+    viewport.width = static_cast<float>(impl.swapchain_extent.width);
+    viewport.height = static_cast<float>(impl.swapchain_extent.height);
+    viewport.minDepth = 0.0f;
+    viewport.maxDepth = 1.0f;
+
+    VkRect2D scissor{};
+    scissor.offset = {0, 0};
+    scissor.extent = impl.swapchain_extent;
+
+    VkPipelineViewportStateCreateInfo vp{};
+    vp.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
+    vp.viewportCount = 1;
+    vp.pViewports = &viewport;
+    vp.scissorCount = 1;
+    vp.pScissors = &scissor;
+
+    VkPipelineRasterizationStateCreateInfo rs{};
+    rs.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
+    rs.polygonMode = VK_POLYGON_MODE_FILL;
+    rs.cullMode = VK_CULL_MODE_NONE;
+    rs.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+    rs.lineWidth = 1.0f;
+
+    VkPipelineMultisampleStateCreateInfo ms{};
+    ms.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
+    ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+
+    VkPipelineColorBlendAttachmentState blend_attachment{};
+    blend_attachment.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                                      VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+
+    VkPipelineColorBlendStateCreateInfo blend{};
+    blend.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
+    blend.attachmentCount = 1;
+    blend.pAttachments = &blend_attachment;
+
+    VkGraphicsPipelineCreateInfo info{};
+    info.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+    info.stageCount = 2;
+    info.pStages = stages;
+    info.pVertexInputState = &vi;
+    info.pInputAssemblyState = &ia;
+    info.pViewportState = &vp;
+    info.pRasterizationState = &rs;
+    info.pMultisampleState = &ms;
+    info.pColorBlendState = &blend;
+    info.layout = impl.pipeline_layout;
+    info.renderPass = impl.render_pass;
+    info.subpass = 0;
+
+    vk_check(vkCreateGraphicsPipelines(impl.device, VK_NULL_HANDLE, 1, &info, nullptr, &impl.pipeline), "vkCreateGraphicsPipelines");
+
+    vkDestroyShaderModule(impl.device, vert, nullptr);
+    vkDestroyShaderModule(impl.device, frag, nullptr);
+}
+
 void create_command_pool_and_buffers(Impl& impl) {
     VkCommandPoolCreateInfo pool_info{};
     pool_info.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
@@ -296,32 +421,8 @@ void create_command_pool_and_buffers(Impl& impl) {
 }
 
 void record_command_buffers(Impl& impl) {
-    for (std::size_t i = 0; i < impl.command_buffers.size(); ++i) {
-        VkCommandBuffer cmd = impl.command_buffers[i];
-
-        VkCommandBufferBeginInfo begin_info{};
-        begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-
-        vk_check(vkBeginCommandBuffer(cmd, &begin_info), "vkBeginCommandBuffer");
-
-        VkClearValue clear_color{};
-        clear_color.color = {{0.05f, 0.07f, 0.15f, 1.0f}};
-
-        VkRenderPassBeginInfo rp_info{};
-        rp_info.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
-        rp_info.renderPass = impl.render_pass;
-        rp_info.framebuffer = impl.framebuffers[i];
-        rp_info.renderArea.offset = {0, 0};
-        rp_info.renderArea.extent = impl.swapchain_extent;
-        rp_info.clearValueCount = 1;
-        rp_info.pClearValues = &clear_color;
-
-        vkCmdBeginRenderPass(cmd, &rp_info, VK_SUBPASS_CONTENTS_INLINE);
-        // No pipeline bound yet; we just clear.
-        vkCmdEndRenderPass(cmd);
-
-        vk_check(vkEndCommandBuffer(cmd), "vkEndCommandBuffer");
-    }
+    // No-op: command buffers are recorded per-frame in draw_frame
+    (void)impl;
 }
 
 void create_sync_objects(Impl& impl) {
@@ -382,9 +483,9 @@ VulkanRenderer::VulkanRenderer(const platform::VulkanContext& ctx,
     create_swapchain(*impl_);
     create_image_views(*impl_);
     create_render_pass(*impl_);
+    create_pipeline(*impl_);
     create_framebuffers(*impl_);
     create_command_pool_and_buffers(*impl_);
-    record_command_buffers(*impl_);
     create_sync_objects(*impl_);
 }
 
@@ -395,6 +496,12 @@ VulkanRenderer::~VulkanRenderer() {
 
     if (impl_->swapchain != VK_NULL_HANDLE) {
         vkDestroySwapchainKHR(impl_->device, impl_->swapchain, nullptr);
+    }
+    if (impl_->pipeline != VK_NULL_HANDLE) {
+        vkDestroyPipeline(impl_->device, impl_->pipeline, nullptr);
+    }
+    if (impl_->pipeline_layout != VK_NULL_HANDLE) {
+        vkDestroyPipelineLayout(impl_->device, impl_->pipeline_layout, nullptr);
     }
     for (auto fb : impl_->framebuffers) {
         vkDestroyFramebuffer(impl_->device, fb, nullptr);
@@ -455,10 +562,32 @@ void VulkanRenderer::resize(std::uint32_t width, std::uint32_t height) {
     create_swapchain(*impl_);
     create_image_views(*impl_);
     create_framebuffers(*impl_);
-    record_command_buffers(*impl_);
+}
+struct CameraPush {
+    float camPos[3];      float planetRadius;
+    float forward[3];     float fovY;
+    float right[3];       float aspect;
+    float up[3];          float pad1;
+};
+
+core::PlanetPosition normalize_vec(const core::PlanetPosition& v) {
+    const float len = metaral::core::length(v);
+    if (len < 1e-6f) {
+        return {0.0f, 1.0f, 0.0f};
+    }
+    const float inv = 1.0f / len;
+    return {v.x * inv, v.y * inv, v.z * inv};
 }
 
-void VulkanRenderer::draw_frame(const Camera&, const world::World&) {
+core::PlanetPosition cross_vec(const core::PlanetPosition& a, const core::PlanetPosition& b) {
+    return {
+        a.y * b.z - a.z * b.y,
+        a.z * b.x - a.x * b.z,
+        a.x * b.y - a.y * b.x,
+    };
+}
+
+void VulkanRenderer::draw_frame(const Camera& camera, const world::World& world) {
     if (impl_->device == VK_NULL_HANDLE || impl_->swapchain == VK_NULL_HANDLE) {
         return;
     }
@@ -479,6 +608,66 @@ void VulkanRenderer::draw_frame(const Camera&, const world::World&) {
     }
     vk_check(res, "vkAcquireNextImageKHR");
 
+    // Build push constants for this frame
+    core::PlanetPosition fwd = normalize_vec(camera.forward);
+    core::PlanetPosition up = normalize_vec(camera.up);
+    core::PlanetPosition right = normalize_vec(cross_vec(fwd, up));
+    up = normalize_vec(cross_vec(right, fwd));
+
+    CameraPush push{};
+    push.camPos[0] = camera.position.x;
+    push.camPos[1] = camera.position.y;
+    push.camPos[2] = camera.position.z;
+    push.planetRadius = world.coords().planet_radius_m;
+
+    push.forward[0] = fwd.x;
+    push.forward[1] = fwd.y;
+    push.forward[2] = fwd.z;
+    push.fovY = camera.fov_y_radians;
+
+    push.right[0] = right.x;
+    push.right[1] = right.y;
+    push.right[2] = right.z;
+    push.aspect = static_cast<float>(impl_->swapchain_extent.width) /
+                  static_cast<float>(impl_->swapchain_extent.height);
+
+    push.up[0] = up.x;
+    push.up[1] = up.y;
+    push.up[2] = up.z;
+
+    // Record command buffer for this image
+    VkCommandBuffer cmd = impl_->command_buffers[image_index];
+    vk_check(vkResetCommandBuffer(cmd, 0), "vkResetCommandBuffer");
+
+    VkCommandBufferBeginInfo begin_info{};
+    begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    vk_check(vkBeginCommandBuffer(cmd, &begin_info), "vkBeginCommandBuffer");
+
+    VkClearValue clear_color{};
+    clear_color.color = {{0.02f, 0.04f, 0.1f, 1.0f}};
+
+    VkRenderPassBeginInfo rp_info{};
+    rp_info.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+    rp_info.renderPass = impl_->render_pass;
+    rp_info.framebuffer = impl_->framebuffers[image_index];
+    rp_info.renderArea.offset = {0, 0};
+    rp_info.renderArea.extent = impl_->swapchain_extent;
+    rp_info.clearValueCount = 1;
+    rp_info.pClearValues = &clear_color;
+
+    vkCmdBeginRenderPass(cmd, &rp_info, VK_SUBPASS_CONTENTS_INLINE);
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, impl_->pipeline);
+    vkCmdPushConstants(cmd,
+                       impl_->pipeline_layout,
+                       VK_SHADER_STAGE_FRAGMENT_BIT,
+                       0,
+                       sizeof(CameraPush),
+                       &push);
+    vkCmdDraw(cmd, 3, 1, 0, 0);
+    vkCmdEndRenderPass(cmd);
+
+    vk_check(vkEndCommandBuffer(cmd), "vkEndCommandBuffer");
+
     VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
 
     VkSubmitInfo submit{};
@@ -487,7 +676,7 @@ void VulkanRenderer::draw_frame(const Camera&, const world::World&) {
     submit.pWaitSemaphores = &impl_->image_available;
     submit.pWaitDstStageMask = &wait_stage;
     submit.commandBufferCount = 1;
-    submit.pCommandBuffers = &impl_->command_buffers[image_index];
+    submit.pCommandBuffers = &cmd;
     submit.signalSemaphoreCount = 1;
     submit.pSignalSemaphores = &impl_->render_finished;
 
