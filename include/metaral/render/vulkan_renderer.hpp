@@ -1,6 +1,7 @@
 #pragma once
 
 #include "metaral/render/camera.hpp"
+#include "metaral/render/sdf_grid.hpp"
 #include "metaral/world/world.hpp"
 #include "metaral/platform/platform.hpp"
 
@@ -14,6 +15,12 @@
 namespace metaral::render {
 
 #ifdef METARAL_ENABLE_VULKAN
+
+struct SdfGridInfo {
+    std::uint32_t dim = 0;
+    float voxel_size = 0.0f;
+    float half_extent = 0.0f;
+};
 
 // Very small, initial Vulkan renderer stub.
 // Goal: own a Vulkan device + swapchain and be able to render
@@ -32,6 +39,10 @@ public:
     void resize(std::uint32_t width, std::uint32_t height);
     void draw_frame(const Camera& camera, const world::World& world);
     void wait_idle();
+
+    SdfGridInfo sdf_grid_info() const;
+    const SdfGrid* sdf_grid() const;
+
     struct Impl;
 
 private:

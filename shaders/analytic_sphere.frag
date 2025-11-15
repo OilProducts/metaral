@@ -18,6 +18,10 @@ layout(std430, set = 0, binding = 0) readonly buffer SdfGrid {
     float values[];
 } uSdf;
 
+layout(std430, set = 0, binding = 1) readonly buffer SdfMaterials {
+    uint values[];
+} uMaterials;
+
 vec3 ray_direction(vec2 uv) {
     // uv in [0,1]; convert to NDC [-1,1]
     float ndcX = 2.0 * uv.x - 1.0;

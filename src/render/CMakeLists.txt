@@ -1,5 +1,6 @@
 add_library(metaral_render
     camera.cpp
+    sdf_grid.cpp
     vulkan_renderer.cpp
 )
 

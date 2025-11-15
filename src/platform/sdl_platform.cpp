@@ -195,7 +195,16 @@ struct LoopState {
     bool key_space = false;
     bool key_shift = false;
     bool key_tab_pressed = false;
+    bool key_1_pressed = false;
+    bool key_2_pressed = false;
+    bool key_3_pressed = false;
+    bool key_plus_pressed = false;
+    bool key_minus_pressed = false;
+    bool key_bracket_left_pressed = false;
+    bool key_bracket_right_pressed = false;
+    bool key_f_pressed = false;
     bool mouse_right_button = false;
+    bool mouse_left_button = false;
     float mouse_dx = 0.0f;
     float mouse_dy = 0.0f;
 };
@@ -243,6 +252,46 @@ void handle_event(const Event& event, LoopState& state) {
                 state.key_tab_pressed = true;
             }
             break;
+        case SDLK_1:
+            if (!event.key.repeat) {
+                state.key_1_pressed = true;
+            }
+            break;
+        case SDLK_2:
+            if (!event.key.repeat) {
+                state.key_2_pressed = true;
+            }
+            break;
+        case SDLK_3:
+            if (!event.key.repeat) {
+                state.key_3_pressed = true;
+            }
+            break;
+        case SDLK_PLUS:
+            if (!event.key.repeat) {
+                state.key_plus_pressed = true;
+            }
+            break;
+        case SDLK_MINUS:
+            if (!event.key.repeat) {
+                state.key_minus_pressed = true;
+            }
+            break;
+        case SDLK_LEFTBRACKET:
+            if (!event.key.repeat) {
+                state.key_bracket_left_pressed = true;
+            }
+            break;
+        case SDLK_RIGHTBRACKET:
+            if (!event.key.repeat) {
+                state.key_bracket_right_pressed = true;
+            }
+            break;
+        case SDLK_F:
+            if (!event.key.repeat) {
+                state.key_f_pressed = true;
+            }
+            break;
         default:
             break;
         }
@@ -288,11 +337,15 @@ void handle_event(const Event& event, LoopState& state) {
     case EventType::MouseButtonDown:
         if (event.mouse_button.button == SDL_BUTTON_RIGHT) {
             state.mouse_right_button = true;
+        } else if (event.mouse_button.button == SDL_BUTTON_LEFT) {
+            state.mouse_left_button = true;
         }
         break;
     case EventType::MouseButtonUp:
         if (event.mouse_button.button == SDL_BUTTON_RIGHT) {
             state.mouse_right_button = false;
+        } else if (event.mouse_button.button == SDL_BUTTON_LEFT) {
+            state.mouse_left_button = false;
         }
         break;
     default:
@@ -335,6 +388,14 @@ int run_app(IApp& app, const WindowConfig& cfg) {
         state.mouse_dx = 0.0f;
         state.mouse_dy = 0.0f;
         state.key_tab_pressed = false;
+        state.key_f_pressed = false;
+        state.key_1_pressed = false;
+        state.key_2_pressed = false;
+        state.key_3_pressed = false;
+        state.key_plus_pressed = false;
+        state.key_minus_pressed = false;
+        state.key_bracket_left_pressed = false;
+        state.key_bracket_right_pressed = false;
 
         Event event;
         while (platform.poll_event(event)) {
@@ -356,6 +417,15 @@ int run_app(IApp& app, const WindowConfig& cfg) {
         frame_input.key_space = state.key_space;
         frame_input.key_shift = state.key_shift;
         frame_input.key_tab_pressed = state.key_tab_pressed;
+        frame_input.key_f_pressed = state.key_f_pressed;
+        frame_input.key_1_pressed = state.key_1_pressed;
+        frame_input.key_2_pressed = state.key_2_pressed;
+        frame_input.key_3_pressed = state.key_3_pressed;
+        frame_input.key_plus_pressed = state.key_plus_pressed;
+        frame_input.key_minus_pressed = state.key_minus_pressed;
+        frame_input.key_bracket_left_pressed = state.key_bracket_left_pressed;
+        frame_input.key_bracket_right_pressed = state.key_bracket_right_pressed;
+        frame_input.mouse_left_button = state.mouse_left_button;
         frame_input.mouse_right_button = state.mouse_right_button;
         frame_input.mouse_delta_x = state.mouse_dx;
         frame_input.mouse_delta_y = state.mouse_dy;

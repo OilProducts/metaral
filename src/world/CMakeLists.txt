@@ -1,5 +1,6 @@
 add_library(metaral_world
     world.cpp
+    terrain.cpp
 )
 
 set_target_properties(metaral_world PROPERTIES

@@ -77,6 +77,15 @@ struct FrameInput {
     bool key_space = false;
     bool key_shift = false;
     bool key_tab_pressed = false;
+    bool key_f_pressed = false;
+    bool key_1_pressed = false;
+    bool key_2_pressed = false;
+    bool key_3_pressed = false;
+    bool key_plus_pressed = false;
+    bool key_minus_pressed = false;
+    bool key_bracket_left_pressed = false;
+    bool key_bracket_right_pressed = false;
+    bool mouse_left_button = false;
     bool mouse_right_button = false;
     float mouse_delta_x = 0.0f;
     float mouse_delta_y = 0.0f;

@@ -21,6 +21,10 @@ Chunk& World::get_or_create_chunk(const core::ChunkCoord& coord) {
     return it->second;
 }
 
+Chunk& World::ensure_chunk_loaded(const core::ChunkCoord& coord) {
+    return get_or_create_chunk(coord);
+}
+
 Chunk* World::find_chunk(const core::ChunkCoord& coord) {
     auto it = chunks_.find(coord);
     if (it == chunks_.end()) {
@@ -37,20 +41,32 @@ const Chunk* World::find_chunk(const core::ChunkCoord& coord) const {
     return &it->second;
 }
 
-namespace {
-
-// x is fastest, then y, then z:
-// idx = (z * cs + y) * cs + x
-inline std::size_t voxel_index(const core::CoordinateConfig& cfg,
-                               std::size_t x,
-                               std::size_t y,
-                               std::size_t z) noexcept
-{
-    const auto cs = static_cast<std::size_t>(cfg.chunk_size);
-    return (z * cs + y) * cs + x;
+Voxel* World::find_voxel(const core::WorldVoxelCoord& coord) {
+    ChunkAndLocal split = split_world_voxel(coord, config_);
+    Chunk* chunk = find_chunk(split.chunk);
+    if (!chunk) {
+        return nullptr;
+    }
+    const auto idx = voxel_index(config_, split.local);
+    return &chunk->voxels[idx];
 }
 
-} // namespace
+const Voxel* World::find_voxel(const core::WorldVoxelCoord& coord) const {
+    ChunkAndLocal split = split_world_voxel(coord, config_);
+    const Chunk* chunk = find_chunk(split.chunk);
+    if (!chunk) {
+        return nullptr;
+    }
+    const auto idx = voxel_index(config_, split.local);
+    return &chunk->voxels[idx];
+}
+
+Voxel& World::get_or_create_voxel(const core::WorldVoxelCoord& coord) {
+    ChunkAndLocal split = split_world_voxel(coord, config_);
+    Chunk& chunk = get_or_create_chunk(split.chunk);
+    const auto idx = voxel_index(config_, split.local);
+    return chunk.voxels[idx];
+}
 
 void fill_sphere(World& world,
                  int chunk_radius,
@@ -65,7 +81,7 @@ void fill_sphere(World& world,
         for (int cy = -chunk_radius; cy <= chunk_radius; ++cy) {
             for (int cz = -chunk_radius; cz <= chunk_radius; ++cz) {
                 core::ChunkCoord chunk_coord{cx, cy, cz};
-                Chunk& chunk = world.get_or_create_chunk(chunk_coord);
+                Chunk& chunk = world.ensure_chunk_loaded(chunk_coord);
 
                 // Fill each voxel in the chunk based on distance from planet center
                 for (std::size_t z = 0; z < cs; ++z) {
@@ -89,7 +105,7 @@ void fill_sphere(World& world,
                                     ? solid_material
                                     : empty_material;
 
-                            const auto idx = voxel_index(cfg, x, y, z);
+                            const auto idx = voxel_index(cfg, local);
                             chunk.voxels[idx].material = material;
                         }
                     }

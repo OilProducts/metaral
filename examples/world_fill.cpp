@@ -1,4 +1,5 @@
 #include "metaral/world/world.hpp"
+#include "metaral/world/terrain.hpp"
 
 #include <iostream>
 
@@ -10,7 +11,7 @@ int main() {
     cfg.planet_center_offset_voxels = {0, 0, 0};
 
     metaral::world::World world(cfg);
-    metaral::world::fill_sphere(world, 2, /*solid*/ 1, /*empty*/ 0);
+    metaral::world::terrain::generate_planet(world, 2, cfg);
 
     std::size_t solid_count = 0;
     for (const auto& [coord, chunk] : world.chunks()) {

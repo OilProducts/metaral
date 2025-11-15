@@ -1,11 +1,14 @@
 #include "metaral/core/coords.hpp"
 #include "metaral/platform/platform.hpp"
 #include "metaral/render/camera.hpp"
+#include "metaral/render/sdf_grid.hpp"
 #include "metaral/render/vulkan_renderer.hpp"
+#include "metaral/world/terrain.hpp"
 #include "metaral/world/world.hpp"
 
 #include <algorithm>
 #include <cmath>
+#include <iostream>
 #include <memory>
 
 #ifdef METARAL_ENABLE_VULKAN
@@ -14,8 +17,17 @@ namespace {
 
 using metaral::core::PlanetPosition;
 
-constexpr float kTerrainNoiseFrequency = 0.18f;
-constexpr float kTerrainNoiseAmplitude = 2.0f;
+enum class EditMode {
+    Dig,    // remove solid -> air
+    Fill,   // add solid
+    Paint,  // change material but keep solid/empty
+};
+
+struct Brush {
+    float radius_m = 2.0f;
+    float hardness = 1.0f;    // 0–1, for future falloff
+    metaral::world::MaterialId material = 1; // default solid
+};
 
 PlanetPosition normalized(const PlanetPosition& v) {
     const float len = metaral::core::length(v);
@@ -115,13 +127,36 @@ PlanetPosition project_tangent(const PlanetPosition& v,
     return scale(tangent, 1.0f / len);
 }
 
-float surface_signed_distance(const PlanetPosition& pos, float planet_radius) {
-    const float len = metaral::core::length(pos);
-    const float wobble =
-        std::sin(pos.x * kTerrainNoiseFrequency) *
-        std::sin(pos.y * kTerrainNoiseFrequency) *
-        std::sin(pos.z * kTerrainNoiseFrequency);
-    return len - planet_radius + wobble * kTerrainNoiseAmplitude;
+float surface_signed_distance(const PlanetPosition& pos,
+                              const metaral::render::SdfGrid& grid) {
+    // Interpret the grid SDF as a true height-above-surface by raymarching
+    // along the local "down" direction instead of using the raw (binary) SDF
+    // sample directly. This keeps the walkabout grounding logic, which expects
+    // a distance in meters, consistent with the rendered SDF.
+    PlanetPosition up = safe_radial_up(pos);
+    PlanetPosition down = scale(up, -1.0f);
+
+    constexpr float kMaxDist     = 500.0f;
+    constexpr float kSurfEpsilon = 0.01f;
+    constexpr int   kMaxSteps    = 128;
+
+    const float t = metaral::render::raymarch_sdf(grid,
+                                                  pos,
+                                                  down,
+                                                  kMaxDist,
+                                                  kSurfEpsilon,
+                                                  kMaxSteps);
+
+    if (t >= kMaxDist) {
+        // Fallback to the analytic radial SDF when the grid does not provide
+        // a hit (e.g., far from the planet).
+        return metaral::core::length(pos) - grid.planet_radius;
+    }
+
+    // Outside the surface this is approximately the height above ground in
+    // meters along the radial direction, matching what the walkabout code
+    // expects.
+    return t;
 }
 
 enum class MovementMode {
@@ -143,6 +178,8 @@ private:
     int window_width_ = 0;
     int window_height_ = 0;
     MovementMode mode_ = MovementMode::FreeFly;
+    EditMode current_mode_ = EditMode::Dig;
+    Brush brush_{};
     float yaw_freefly_ = 0.0f;
     float pitch_freefly_ = 0.0f;
     float walk_eye_height_m_ = 2.0f;
@@ -156,7 +193,7 @@ void VulkanViewer::on_init(const metaral::platform::AppInitContext& ctx) {
     coords_.planet_center_offset_voxels = {0, 0, 0};
 
     world_ = std::make_unique<metaral::world::World>(coords_);
-    metaral::world::fill_sphere(*world_, 4, /*solid*/ 1, /*empty*/ 0);
+    metaral::world::terrain::generate_planet(*world_, 4, coords_);
 
     window_width_ = ctx.window_width;
     window_height_ = ctx.window_height;
@@ -200,6 +237,187 @@ void VulkanViewer::on_frame(const metaral::platform::FrameContext& ctx) {
     const float max_walk_pitch = 0.6f;  // ~35 degrees
 
     PlanetPosition radial_up = safe_radial_up(camera_.position);
+
+    // Tool/brush input (no editing yet).
+    if (ctx.input.key_1_pressed) {
+        current_mode_ = EditMode::Dig;
+        std::cout << "Edit mode: Dig\n";
+    }
+    if (ctx.input.key_2_pressed) {
+        current_mode_ = EditMode::Fill;
+        std::cout << "Edit mode: Fill\n";
+    }
+    if (ctx.input.key_3_pressed) {
+        current_mode_ = EditMode::Paint;
+        std::cout << "Edit mode: Paint\n";
+    }
+
+    constexpr float kMinBrushRadius = 0.5f;
+    constexpr float kMaxBrushRadius = 20.0f;
+    constexpr float kBrushStep = 0.5f;
+
+    if (ctx.input.key_plus_pressed) {
+        brush_.radius_m = std::min(kMaxBrushRadius, brush_.radius_m + kBrushStep);
+        std::cout << "Brush radius increased to " << brush_.radius_m << " m\n";
+    }
+    if (ctx.input.key_minus_pressed) {
+        brush_.radius_m = std::max(kMinBrushRadius, brush_.radius_m - kBrushStep);
+        std::cout << "Brush radius decreased to " << brush_.radius_m << " m\n";
+    }
+
+    // Cycle through a small set of demo material IDs: 1,2,3,...
+    if (ctx.input.key_bracket_right_pressed) {
+        if (brush_.material == 0) {
+            brush_.material = 1;
+        } else {
+            brush_.material = static_cast<metaral::world::MaterialId>(brush_.material + 1);
+        }
+        std::cout << "Brush material increased to " << brush_.material << "\n";
+    }
+    if (ctx.input.key_bracket_left_pressed) {
+        if (brush_.material > 1) {
+            brush_.material = static_cast<metaral::world::MaterialId>(brush_.material - 1);
+        }
+        std::cout << "Brush material decreased to " << brush_.material << "\n";
+    }
+
+    // Tool fire: left mouse button. For now this only computes the hit and
+    // brush bounds and logs them; it does not modify voxels.
+    if (ctx.input.mouse_left_button && renderer_) {
+        const metaral::render::SdfGrid* grid = renderer_->sdf_grid();
+        if (grid) {
+            constexpr float kMaxDist = 1000.0f;
+            constexpr float kSurfEpsilon = 0.05f;
+            constexpr int   kMaxSteps = 128;
+
+            PlanetPosition dir = normalized(camera_.forward);
+            PlanetPosition hit_pos{};
+            const bool hit = metaral::render::raycast_sdf(
+                *grid,
+                camera_.position,
+                dir,
+                kMaxDist,
+                kSurfEpsilon,
+                kMaxSteps,
+                hit_pos);
+
+            if (hit) {
+                // Approximate surface normal by radial direction. This matches
+                // the spherical planet assumption and is good enough for now.
+                PlanetPosition normal = normalized(hit_pos);
+
+                PlanetPosition brush_center = hit_pos;
+                if (current_mode_ == EditMode::Dig) {
+                    const float offset = 0.5f * brush_.radius_m;
+                    brush_center = PlanetPosition{
+                        hit_pos.x - normal.x * offset,
+                        hit_pos.y - normal.y * offset,
+                        hit_pos.z - normal.z * offset,
+                    };
+                }
+
+                PlanetPosition min_p{
+                    brush_center.x - brush_.radius_m,
+                    brush_center.y - brush_.radius_m,
+                    brush_center.z - brush_.radius_m,
+                };
+                PlanetPosition max_p{
+                    brush_center.x + brush_.radius_m,
+                    brush_center.y + brush_.radius_m,
+                    brush_center.z + brush_.radius_m,
+                };
+
+                const metaral::core::WorldVoxelCoord min_v =
+                    metaral::core::to_world_voxel(min_p, coords_);
+                const metaral::core::WorldVoxelCoord max_v =
+                    metaral::core::to_world_voxel(max_p, coords_);
+
+                std::cout << "Tool fired in mode "
+                          << (current_mode_ == EditMode::Dig ? "Dig" :
+                              current_mode_ == EditMode::Fill ? "Fill" : "Paint")
+                          << " at hit_pos=("
+                          << hit_pos.x << ", " << hit_pos.y << ", " << hit_pos.z
+                          << "), brush_center=("
+                          << brush_center.x << ", " << brush_center.y << ", " << brush_center.z
+                          << "), voxel_bounds=[("
+                          << min_v.x << ", " << min_v.y << ", " << min_v.z << ") -> ("
+                          << max_v.x << ", " << max_v.y << ", " << max_v.z << ")]\n";
+            } else {
+                std::cout << "Tool fired but raycast hit nothing\n";
+            }
+        } else {
+            std::cout << "Tool fired but SDF grid not built yet\n";
+        }
+    }
+
+    if (ctx.input.key_f_pressed && renderer_) {
+        const metaral::render::SdfGrid* grid = renderer_->sdf_grid();
+        if (grid) {
+            // Debug raycast: shoot from camera along forward, map the hit
+            // point back to a world voxel. To avoid hitting the outer "air"
+            // voxel shell due to SDF interpolation (zero-crossing landing
+            // between solid/empty voxel centers), we bias the hit point a
+            // bit along the SDF normal into the solid region before
+            // converting to a voxel coordinate.
+            constexpr float kMaxDist = 500.0f;
+            constexpr float kSurfEpsilon = 0.01f;
+            constexpr int   kMaxSteps = 128;
+
+            PlanetPosition hit_pos{};
+            const bool hit = metaral::render::raycast_sdf(
+                *grid,
+                camera_.position,
+                camera_.forward,
+                kMaxDist,
+                kSurfEpsilon,
+                kMaxSteps,
+                hit_pos);
+
+            if (hit && world_) {
+                // Estimate SDF normal at the hit; this mirrors the GLSL
+                // estimate_normal() helper used in analytic_sphere.frag.
+                const float eps = 0.5f * grid->voxel_size;
+                const float dx =
+                    metaral::render::sample_sdf(*grid, PlanetPosition{hit_pos.x + eps, hit_pos.y, hit_pos.z}) -
+                    metaral::render::sample_sdf(*grid, PlanetPosition{hit_pos.x - eps, hit_pos.y, hit_pos.z});
+                const float dy =
+                    metaral::render::sample_sdf(*grid, PlanetPosition{hit_pos.x, hit_pos.y + eps, hit_pos.z}) -
+                    metaral::render::sample_sdf(*grid, PlanetPosition{hit_pos.x, hit_pos.y - eps, hit_pos.z});
+                const float dz =
+                    metaral::render::sample_sdf(*grid, PlanetPosition{hit_pos.x, hit_pos.y, hit_pos.z + eps}) -
+                    metaral::render::sample_sdf(*grid, PlanetPosition{hit_pos.x, hit_pos.y, hit_pos.z - eps});
+
+                PlanetPosition normal_ws = normalized(PlanetPosition{dx, dy, dz});
+
+                // Nudge slightly inside the surface along -normal so that
+                // we land in the solid voxel instead of the outer empty one.
+                const float bias = 0.5f * coords_.voxel_size_m;
+                PlanetPosition biased_hit{
+                    hit_pos.x - normal_ws.x * bias,
+                    hit_pos.y - normal_ws.y * bias,
+                    hit_pos.z - normal_ws.z * bias,
+                };
+
+                const auto world_voxel =
+                    metaral::world::world_voxel_from_planet_position(biased_hit, coords_);
+                const metaral::world::Voxel* voxel =
+                    world_->find_voxel(world_voxel);
+
+                const auto material =
+                    voxel ? voxel->material : metaral::world::MaterialId{0};
+
+                std::cout << "Ray hit voxel at ("
+                          << world_voxel.x << ", "
+                          << world_voxel.y << ", "
+                          << world_voxel.z << "), material="
+                          << material << "\n";
+            } else {
+                std::cout << "Ray hit nothing in SDF grid\n";
+            }
+        } else {
+            std::cout << "SDF grid not built yet; no raycast\n";
+        }
+    }
 
     if (ctx.input.key_tab_pressed) {
         if (mode_ == MovementMode::FreeFly) {
@@ -317,7 +535,16 @@ void VulkanViewer::on_frame(const metaral::platform::FrameContext& ctx) {
     if (mode_ == MovementMode::Walkabout) {
         radial_up = safe_radial_up(camera_.position);
         const float desired_height = walk_eye_height_m_;
-        float surface_height = surface_signed_distance(camera_.position, coords_.planet_radius_m);
+        const metaral::render::SdfGrid* grid =
+            renderer_ ? renderer_->sdf_grid() : nullptr;
+
+        float surface_height = 0.0f;
+        if (grid) {
+            surface_height = surface_signed_distance(camera_.position, *grid);
+        } else {
+            surface_height =
+                metaral::world::terrain::terrain_signed_distance(camera_.position, coords_);
+        }
         const bool grounded = surface_height <= desired_height + 0.05f && vertical_velocity_ <= 0.0f;
 
         if (ctx.input.key_space && grounded) {
@@ -329,7 +556,12 @@ void VulkanViewer::on_frame(const metaral::platform::FrameContext& ctx) {
         vertical_velocity_ += gravity_accel * dt;
         camera_.position = add(camera_.position, scale(radial_up, vertical_velocity_ * dt));
 
-        surface_height = surface_signed_distance(camera_.position, coords_.planet_radius_m);
+        if (grid) {
+            surface_height = surface_signed_distance(camera_.position, *grid);
+        } else {
+            surface_height =
+                metaral::world::terrain::terrain_signed_distance(camera_.position, coords_);
+        }
         if (surface_height < desired_height) {
             const float correction = desired_height - surface_height;
             camera_.position = add(camera_.position, scale(radial_up, correction));
