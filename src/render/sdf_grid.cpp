@@ -238,4 +238,87 @@ bool raycast_sdf(const SdfGrid& grid,
     return true;
 }
 
+void update_sdf_region_from_world(const world::World& world,
+                                  const core::CoordinateConfig& cfg,
+                                  const core::PlanetPosition& min_p,
+                                  const core::PlanetPosition& max_p,
+                                  SdfGrid& out,
+                                  float* sdf_gpu,
+                                  std::uint32_t* mat_gpu)
+{
+    const float voxel_size = out.voxel_size;
+    const float half_extent = out.half_extent;
+    const std::uint32_t dim = out.dim;
+
+    if (dim == 0 || voxel_size <= 0.0f) {
+        return;
+    }
+
+    const float grid_min = -half_extent;
+
+    auto clamp_i = [dim](int i) {
+        if (i < 0) {
+            return 0;
+        }
+        const int max_i = static_cast<int>(dim) - 1;
+        if (i > max_i) {
+            return max_i;
+        }
+        return i;
+    };
+
+    auto to_index = [&](float p) {
+        const float coord = (p + half_extent) / voxel_size - 0.5f;
+        return static_cast<int>(std::floor(coord));
+    };
+
+    const int ix_min = clamp_i(to_index(min_p.x));
+    const int iy_min = clamp_i(to_index(min_p.y));
+    const int iz_min = clamp_i(to_index(min_p.z));
+    const int ix_max = clamp_i(to_index(max_p.x));
+    const int iy_max = clamp_i(to_index(max_p.y));
+    const int iz_max = clamp_i(to_index(max_p.z));
+
+    for (int iz = iz_min; iz <= iz_max; ++iz) {
+        for (int iy = iy_min; iy <= iy_max; ++iy) {
+            for (int ix = ix_min; ix <= ix_max; ++ix) {
+                const float x = grid_min + (static_cast<float>(ix) + 0.5f) * voxel_size;
+                const float y = grid_min + (static_cast<float>(iy) + 0.5f) * voxel_size;
+                const float z = grid_min + (static_cast<float>(iz) + 0.5f) * voxel_size;
+
+                const core::PlanetPosition pos{x, y, z};
+                const core::WorldVoxelCoord world_voxel =
+                    core::to_world_voxel(pos, cfg);
+
+                const world::Voxel* voxel = world.find_voxel(world_voxel);
+                const bool solid = voxel && voxel->material != 0;
+
+                const float distance =
+                    solid ? -0.5f * cfg.voxel_size_m : 0.5f * cfg.voxel_size_m;
+
+                const std::size_t idx = linear_index(
+                    dim,
+                    static_cast<std::uint32_t>(ix),
+                    static_cast<std::uint32_t>(iy),
+                    static_cast<std::uint32_t>(iz));
+
+                out.values[idx] = distance;
+
+                std::uint16_t material_id = 0;
+                if (solid && voxel) {
+                    material_id = static_cast<std::uint16_t>(voxel->material);
+                }
+                out.materials[idx] = material_id;
+
+                if (sdf_gpu) {
+                    sdf_gpu[idx] = distance;
+                }
+                if (mat_gpu) {
+                    mat_gpu[idx] = static_cast<std::uint32_t>(material_id);
+                }
+            }
+        }
+    }
+}
+
 } // namespace metaral::render

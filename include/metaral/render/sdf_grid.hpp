@@ -40,4 +40,12 @@ bool raycast_sdf(const SdfGrid& grid,
                  int   max_steps,
                  core::PlanetPosition& out_hit_pos);
 
+void update_sdf_region_from_world(const world::World& world,
+                                  const core::CoordinateConfig& cfg,
+                                  const core::PlanetPosition& min_p,
+                                  const core::PlanetPosition& max_p,
+                                  SdfGrid& out,
+                                  float* sdf_gpu = nullptr,
+                                  std::uint32_t* mat_gpu = nullptr);
+
 } // namespace metaral::render

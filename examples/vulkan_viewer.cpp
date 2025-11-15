@@ -3,6 +3,7 @@
 #include "metaral/render/camera.hpp"
 #include "metaral/render/sdf_grid.hpp"
 #include "metaral/render/vulkan_renderer.hpp"
+#include "metaral/world/edit.hpp"
 #include "metaral/world/terrain.hpp"
 #include "metaral/world/world.hpp"
 
@@ -17,16 +18,16 @@ namespace {
 
 using metaral::core::PlanetPosition;
 
-enum class EditMode {
-    Dig,    // remove solid -> air
-    Fill,   // add solid
-    Paint,  // change material but keep solid/empty
-};
-
 struct Brush {
     float radius_m = 2.0f;
     float hardness = 1.0f;    // 0–1, for future falloff
     metaral::world::MaterialId material = 1; // default solid
+};
+
+struct DirtyRegion {
+    PlanetPosition min_p{};
+    PlanetPosition max_p{};
+    bool valid = false;
 };
 
 PlanetPosition normalized(const PlanetPosition& v) {
@@ -178,8 +179,9 @@ private:
     int window_width_ = 0;
     int window_height_ = 0;
     MovementMode mode_ = MovementMode::FreeFly;
-    EditMode current_mode_ = EditMode::Dig;
+    metaral::world::EditMode current_mode_ = metaral::world::EditMode::Dig;
     Brush brush_{};
+    DirtyRegion sdf_dirty_{};
     float yaw_freefly_ = 0.0f;
     float pitch_freefly_ = 0.0f;
     float walk_eye_height_m_ = 2.0f;
@@ -240,15 +242,15 @@ void VulkanViewer::on_frame(const metaral::platform::FrameContext& ctx) {
 
     // Tool/brush input (no editing yet).
     if (ctx.input.key_1_pressed) {
-        current_mode_ = EditMode::Dig;
+        current_mode_ = metaral::world::EditMode::Dig;
         std::cout << "Edit mode: Dig\n";
     }
     if (ctx.input.key_2_pressed) {
-        current_mode_ = EditMode::Fill;
+        current_mode_ = metaral::world::EditMode::Fill;
         std::cout << "Edit mode: Fill\n";
     }
     if (ctx.input.key_3_pressed) {
-        current_mode_ = EditMode::Paint;
+        current_mode_ = metaral::world::EditMode::Paint;
         std::cout << "Edit mode: Paint\n";
     }
 
@@ -281,8 +283,8 @@ void VulkanViewer::on_frame(const metaral::platform::FrameContext& ctx) {
         std::cout << "Brush material decreased to " << brush_.material << "\n";
     }
 
-    // Tool fire: left mouse button. For now this only computes the hit and
-    // brush bounds and logs them; it does not modify voxels.
+    // Tool fire: left mouse button. This computes the hit, applies the brush
+    // to voxels, tracks a dirty SDF region, and logs debug info.
     if (ctx.input.mouse_left_button && renderer_) {
         const metaral::render::SdfGrid* grid = renderer_->sdf_grid();
         if (grid) {
@@ -307,7 +309,7 @@ void VulkanViewer::on_frame(const metaral::platform::FrameContext& ctx) {
                 PlanetPosition normal = normalized(hit_pos);
 
                 PlanetPosition brush_center = hit_pos;
-                if (current_mode_ == EditMode::Dig) {
+                if (current_mode_ == metaral::world::EditMode::Dig) {
                     const float offset = 0.5f * brush_.radius_m;
                     brush_center = PlanetPosition{
                         hit_pos.x - normal.x * offset,
@@ -327,14 +329,50 @@ void VulkanViewer::on_frame(const metaral::platform::FrameContext& ctx) {
                     brush_center.z + brush_.radius_m,
                 };
 
+                if (world_) {
+                    metaral::world::EditStats stats{};
+                    metaral::world::apply_spherical_brush(
+                        *world_,
+                        coords_,
+                        brush_center,
+                        brush_.radius_m,
+                        current_mode_,
+                        brush_.material,
+                        &stats);
+
+                    // Expand the accumulated dirty region in world space.
+                    if (!sdf_dirty_.valid) {
+                        sdf_dirty_.min_p = min_p;
+                        sdf_dirty_.max_p = max_p;
+                        sdf_dirty_.valid = true;
+                    } else {
+                        sdf_dirty_.min_p.x = std::min(sdf_dirty_.min_p.x, min_p.x);
+                        sdf_dirty_.min_p.y = std::min(sdf_dirty_.min_p.y, min_p.y);
+                        sdf_dirty_.min_p.z = std::min(sdf_dirty_.min_p.z, min_p.z);
+                        sdf_dirty_.max_p.x = std::max(sdf_dirty_.max_p.x, max_p.x);
+                        sdf_dirty_.max_p.y = std::max(sdf_dirty_.max_p.y, max_p.y);
+                        sdf_dirty_.max_p.z = std::max(sdf_dirty_.max_p.z, max_p.z);
+                    }
+
+                    std::cout << "Brush applied: touched "
+                              << stats.voxels_touched
+                              << ", changed "
+                              << stats.voxels_changed
+                              << "\n";
+
+                    // Mark the renderer's SDF grid as dirty in this region so
+                    // it is updated to reflect the changed voxels.
+                    renderer_->mark_sdf_dirty(min_p, max_p);
+                }
+
                 const metaral::core::WorldVoxelCoord min_v =
                     metaral::core::to_world_voxel(min_p, coords_);
                 const metaral::core::WorldVoxelCoord max_v =
                     metaral::core::to_world_voxel(max_p, coords_);
 
                 std::cout << "Tool fired in mode "
-                          << (current_mode_ == EditMode::Dig ? "Dig" :
-                              current_mode_ == EditMode::Fill ? "Fill" : "Paint")
+                          << (current_mode_ == metaral::world::EditMode::Dig ? "Dig" :
+                              current_mode_ == metaral::world::EditMode::Fill ? "Fill" : "Paint")
                           << " at hit_pos=("
                           << hit_pos.x << ", " << hit_pos.y << ", " << hit_pos.z
                           << "), brush_center=("

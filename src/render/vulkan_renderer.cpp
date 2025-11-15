@@ -59,6 +59,9 @@ struct VulkanRenderer::Impl {
     float sdf_radius = 0.0f;
     float sdf_half_extent = 0.0f;
     SdfGrid sdf_grid;
+    bool sdf_dirty = false; // indicates whether a dirty region is pending
+    core::PlanetPosition dirty_min{};
+    core::PlanetPosition dirty_max{};
 };
 
 namespace {
@@ -466,116 +469,132 @@ void create_pipeline(Impl& impl) {
 
 void ensure_sdf_grid(Impl& impl,
                      const world::World& world,
-                     const core::CoordinateConfig& cfg) {
+                     const core::CoordinateConfig& cfg,
+                     bool force_rebuild) {
     if (impl.device == VK_NULL_HANDLE) {
         return;
     }
 
-    // For now the world is static: once we've built an SDF grid for the
-    // current configuration, we can reuse it across frames. When the world
-    // becomes editable, this should be extended with a proper "dirty" flag.
-    if (impl.sdf_dim != 0 &&
-        impl.sdf_voxel_size > 0.0f &&
-        impl.sdf_radius == cfg.planet_radius_m) {
+    const bool needs_full_rebuild =
+        force_rebuild ||
+        impl.sdf_dim == 0 ||
+        impl.sdf_voxel_size <= 0.0f ||
+        impl.sdf_radius != cfg.planet_radius_m;
+
+    // If no full rebuild is needed and there's no dirty region, the grid and
+    // GPU buffers are already up-to-date.
+    if (!needs_full_rebuild && !impl.sdf_dirty) {
         return;
     }
 
-    build_sdf_grid_from_world(world, cfg, impl.sdf_grid);
-
-    if (impl.sdf_buffer != VK_NULL_HANDLE) {
-        vkDestroyBuffer(impl.device, impl.sdf_buffer, nullptr);
-        impl.sdf_buffer = VK_NULL_HANDLE;
-    }
-    if (impl.sdf_memory != VK_NULL_HANDLE) {
-        vkFreeMemory(impl.device, impl.sdf_memory, nullptr);
-        impl.sdf_memory = VK_NULL_HANDLE;
-    }
-    if (impl.material_buffer != VK_NULL_HANDLE) {
-        vkDestroyBuffer(impl.device, impl.material_buffer, nullptr);
-        impl.material_buffer = VK_NULL_HANDLE;
-    }
-    if (impl.material_memory != VK_NULL_HANDLE) {
-        vkFreeMemory(impl.device, impl.material_memory, nullptr);
-        impl.material_memory = VK_NULL_HANDLE;
+    // For a full rebuild, recompute the entire grid on the CPU first.
+    if (needs_full_rebuild) {
+        build_sdf_grid_from_world(world, cfg, impl.sdf_grid);
+        impl.sdf_dim = impl.sdf_grid.dim;
+        impl.sdf_voxel_size = impl.sdf_grid.voxel_size;
+        impl.sdf_radius = cfg.planet_radius_m;
+        impl.sdf_half_extent = impl.sdf_grid.half_extent;
+        impl.sdf_dirty = false;
     }
 
-    VkBufferCreateInfo sdf_info{};
-    sdf_info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
-    sdf_info.size = impl.sdf_grid.values.size() * sizeof(float);
-    sdf_info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
-    sdf_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    const std::size_t sdf_bytes =
+        impl.sdf_grid.values.size() * sizeof(float);
+    const std::size_t mat_count = impl.sdf_grid.materials.size();
 
-    vk_check(vkCreateBuffer(impl.device, &sdf_info, nullptr, &impl.sdf_buffer),
-             "vkCreateBuffer(sdf_buffer)");
+    if (impl.sdf_buffer == VK_NULL_HANDLE) {
+        VkBufferCreateInfo sdf_info{};
+        sdf_info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+        sdf_info.size = sdf_bytes;
+        sdf_info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+        sdf_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
 
-    VkMemoryRequirements sdf_requirements{};
-    vkGetBufferMemoryRequirements(impl.device, impl.sdf_buffer, &sdf_requirements);
+        vk_check(vkCreateBuffer(impl.device, &sdf_info, nullptr, &impl.sdf_buffer),
+                 "vkCreateBuffer(sdf_buffer)");
 
-    VkMemoryAllocateInfo sdf_alloc{};
-    sdf_alloc.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-    sdf_alloc.allocationSize = sdf_requirements.size;
-    sdf_alloc.memoryTypeIndex = find_memory_type(
-        impl,
-        sdf_requirements.memoryTypeBits,
-        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        VkMemoryRequirements sdf_requirements{};
+        vkGetBufferMemoryRequirements(impl.device, impl.sdf_buffer, &sdf_requirements);
 
-    vk_check(vkAllocateMemory(impl.device, &sdf_alloc, nullptr, &impl.sdf_memory),
-             "vkAllocateMemory(sdf_memory)");
-    vk_check(vkBindBufferMemory(impl.device, impl.sdf_buffer, impl.sdf_memory, 0),
-             "vkBindBufferMemory(sdf_buffer)");
+        VkMemoryAllocateInfo sdf_alloc{};
+        sdf_alloc.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+        sdf_alloc.allocationSize = sdf_requirements.size;
+        sdf_alloc.memoryTypeIndex = find_memory_type(
+            impl,
+            sdf_requirements.memoryTypeBits,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
 
-    void* mapped_memory = nullptr;
+        vk_check(vkAllocateMemory(impl.device, &sdf_alloc, nullptr, &impl.sdf_memory),
+                 "vkAllocateMemory(sdf_memory)");
+        vk_check(vkBindBufferMemory(impl.device, impl.sdf_buffer, impl.sdf_memory, 0),
+                 "vkBindBufferMemory(sdf_buffer)");
+    }
+
+    if (impl.material_buffer == VK_NULL_HANDLE) {
+        VkBufferCreateInfo mat_info{};
+        mat_info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+        mat_info.size = mat_count * sizeof(std::uint32_t);
+        mat_info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+        mat_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+
+        vk_check(vkCreateBuffer(impl.device, &mat_info, nullptr, &impl.material_buffer),
+                 "vkCreateBuffer(material_buffer)");
+
+        VkMemoryRequirements mat_requirements{};
+        vkGetBufferMemoryRequirements(impl.device, impl.material_buffer, &mat_requirements);
+
+        VkMemoryAllocateInfo mat_alloc{};
+        mat_alloc.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+        mat_alloc.allocationSize = mat_requirements.size;
+        mat_alloc.memoryTypeIndex = find_memory_type(
+            impl,
+            mat_requirements.memoryTypeBits,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+
+        vk_check(vkAllocateMemory(impl.device, &mat_alloc, nullptr, &impl.material_memory),
+                 "vkAllocateMemory(material_memory)");
+        vk_check(vkBindBufferMemory(impl.device, impl.material_buffer, impl.material_memory, 0),
+                 "vkBindBufferMemory(material_buffer)");
+    }
+
+    void* mapped_sdf = nullptr;
     vk_check(vkMapMemory(impl.device,
                          impl.sdf_memory,
                          0,
-                         sdf_info.size,
+                         sdf_bytes,
                          0,
-                         &mapped_memory),
+                         &mapped_sdf),
              "vkMapMemory(sdf_memory)");
-    std::memcpy(mapped_memory, impl.sdf_grid.values.data(), sdf_info.size);
-    vkUnmapMemory(impl.device, impl.sdf_memory);
+    float* sdf_gpu = static_cast<float*>(mapped_sdf);
 
-    // Material buffer: expand uint16_t -> uint32_t for GLSL SSBO.
-    const std::size_t mat_count = impl.sdf_grid.materials.size();
-    std::vector<std::uint32_t> mat_u32(mat_count);
-    for (std::size_t i = 0; i < mat_count; ++i) {
-        mat_u32[i] = static_cast<std::uint32_t>(impl.sdf_grid.materials[i]);
-    }
-
-    VkBufferCreateInfo mat_info{};
-    mat_info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
-    mat_info.size = mat_u32.size() * sizeof(std::uint32_t);
-    mat_info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
-    mat_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-
-    vk_check(vkCreateBuffer(impl.device, &mat_info, nullptr, &impl.material_buffer),
-             "vkCreateBuffer(material_buffer)");
-
-    VkMemoryRequirements mat_requirements{};
-    vkGetBufferMemoryRequirements(impl.device, impl.material_buffer, &mat_requirements);
-
-    VkMemoryAllocateInfo mat_alloc{};
-    mat_alloc.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-    mat_alloc.allocationSize = mat_requirements.size;
-    mat_alloc.memoryTypeIndex = find_memory_type(
-        impl,
-        mat_requirements.memoryTypeBits,
-        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-
-    vk_check(vkAllocateMemory(impl.device, &mat_alloc, nullptr, &impl.material_memory),
-             "vkAllocateMemory(material_memory)");
-    vk_check(vkBindBufferMemory(impl.device, impl.material_buffer, impl.material_memory, 0),
-             "vkBindBufferMemory(material_buffer)");
-
-    void* mat_mapped = nullptr;
+    void* mapped_mat = nullptr;
     vk_check(vkMapMemory(impl.device,
                          impl.material_memory,
                          0,
-                         mat_info.size,
+                         mat_count * sizeof(std::uint32_t),
                          0,
-                         &mat_mapped),
+                         &mapped_mat),
              "vkMapMemory(material_memory)");
-    std::memcpy(mat_mapped, mat_u32.data(), mat_info.size);
+    auto* mat_gpu = static_cast<std::uint32_t*>(mapped_mat);
+
+    if (needs_full_rebuild) {
+        // Full rebuild: mirror the entire CPU grid into the GPU buffers.
+        for (std::size_t idx = 0; idx < impl.sdf_grid.values.size(); ++idx) {
+            sdf_gpu[idx] = impl.sdf_grid.values[idx];
+            mat_gpu[idx] = static_cast<std::uint32_t>(impl.sdf_grid.materials[idx]);
+        }
+    } else if (impl.sdf_dirty) {
+        // Incremental update: only touch samples inside the dirty world-space
+        // AABB, updating both CPU grid and GPU buffers.
+        update_sdf_region_from_world(world,
+                                     cfg,
+                                     impl.dirty_min,
+                                     impl.dirty_max,
+                                     impl.sdf_grid,
+                                     sdf_gpu,
+                                     mat_gpu);
+        impl.sdf_dirty = false;
+    }
+
+    vkUnmapMemory(impl.device, impl.sdf_memory);
     vkUnmapMemory(impl.device, impl.material_memory);
 
     impl.sdf_dim = impl.sdf_grid.dim;
@@ -612,12 +631,12 @@ void ensure_sdf_grid(Impl& impl,
     VkDescriptorBufferInfo sdf_desc{};
     sdf_desc.buffer = impl.sdf_buffer;
     sdf_desc.offset = 0;
-    sdf_desc.range = sdf_info.size;
+    sdf_desc.range = sdf_bytes;
 
     VkDescriptorBufferInfo mat_desc{};
     mat_desc.buffer = impl.material_buffer;
     mat_desc.offset = 0;
-    mat_desc.range = mat_info.size;
+    mat_desc.range = mat_count * sizeof(std::uint32_t);
 
     VkWriteDescriptorSet writes[2]{};
 
@@ -870,7 +889,11 @@ void VulkanRenderer::draw_frame(const Camera& camera, const world::World& world)
     }
     vk_check(res, "vkAcquireNextImageKHR");
 
-    ensure_sdf_grid(*impl_, world, world.coords());
+    const bool force_rebuild =
+        impl_->sdf_dim == 0 ||
+        impl_->sdf_voxel_size <= 0.0f ||
+        impl_->sdf_radius != world.coords().planet_radius_m;
+    ensure_sdf_grid(*impl_, world, world.coords(), force_rebuild);
 
     // Build push constants for this frame
     core::PlanetPosition fwd = normalize_vec(camera.forward);
@@ -993,6 +1016,25 @@ const SdfGrid* VulkanRenderer::sdf_grid() const {
 void VulkanRenderer::wait_idle() {
     if (impl_->device != VK_NULL_HANDLE) {
         vkDeviceWaitIdle(impl_->device);
+    }
+}
+
+void VulkanRenderer::mark_sdf_dirty(const core::PlanetPosition& min_p,
+                                    const core::PlanetPosition& max_p) {
+    if (!impl_) {
+        return;
+    }
+    if (!impl_->sdf_dirty) {
+        impl_->dirty_min = min_p;
+        impl_->dirty_max = max_p;
+        impl_->sdf_dirty = true;
+    } else {
+        impl_->dirty_min.x = std::min(impl_->dirty_min.x, min_p.x);
+        impl_->dirty_min.y = std::min(impl_->dirty_min.y, min_p.y);
+        impl_->dirty_min.z = std::min(impl_->dirty_min.z, min_p.z);
+        impl_->dirty_max.x = std::max(impl_->dirty_max.x, max_p.x);
+        impl_->dirty_max.y = std::max(impl_->dirty_max.y, max_p.y);
+        impl_->dirty_max.z = std::max(impl_->dirty_max.z, max_p.z);
     }
 }
 

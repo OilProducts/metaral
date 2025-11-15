@@ -40,6 +40,12 @@ public:
     void draw_frame(const Camera& camera, const world::World& world);
     void wait_idle();
 
+    // Mark the SDF grid as dirty in a given world-space region; the grid will
+    // be updated on the next frame. Passing min == max lets you force a full
+    // rebuild if desired.
+    void mark_sdf_dirty(const core::PlanetPosition& min_p,
+                        const core::PlanetPosition& max_p);
+
     SdfGridInfo sdf_grid_info() const;
     const SdfGrid* sdf_grid() const;
 
