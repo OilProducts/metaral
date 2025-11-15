@@ -14,6 +14,9 @@ namespace {
 
 using metaral::core::PlanetPosition;
 
+constexpr float kTerrainNoiseFrequency = 0.18f;
+constexpr float kTerrainNoiseAmplitude = 2.0f;
+
 PlanetPosition normalized(const PlanetPosition& v) {
     const float len = metaral::core::length(v);
     if (len < 1e-6f) {
@@ -72,11 +75,6 @@ CameraBasis make_freefly_basis(float yaw_radians, float pitch_radians) {
     return basis;
 }
 
-struct WalkFrame {
-    PlanetPosition tangent_x{};
-    PlanetPosition tangent_z{};
-};
-
 PlanetPosition safe_radial_up(const PlanetPosition& pos) {
     PlanetPosition radial = normalized(pos);
     if (metaral::core::length(radial) < 1e-6f) {
@@ -85,66 +83,45 @@ PlanetPosition safe_radial_up(const PlanetPosition& pos) {
     return radial;
 }
 
-WalkFrame make_walk_frame(const PlanetPosition& radial_up) {
-    PlanetPosition reference_forward{0.0f, 0.0f, 1.0f};
-    if (std::abs(dot(reference_forward, radial_up)) > 0.95f) {
-        reference_forward = {1.0f, 0.0f, 0.0f};
-    }
+PlanetPosition rotate_around_axis(const PlanetPosition& v,
+                                  const PlanetPosition& axis,
+                                  float angle) {
+    PlanetPosition a = normalized(axis);
+    const float c = std::cos(angle);
+    const float s = std::sin(angle);
 
-    PlanetPosition tangent_x = normalized(cross(reference_forward, radial_up));
-    if (metaral::core::length(tangent_x) < 1e-6f) {
-        tangent_x = {1.0f, 0.0f, 0.0f};
-    }
-    PlanetPosition tangent_z = normalized(cross(radial_up, tangent_x));
-    return {tangent_x, tangent_z};
+    PlanetPosition term1 = scale(v, c);
+    PlanetPosition term2 = scale(cross(a, v), s);
+    PlanetPosition term3 = scale(a, dot(a, v) * (1.0f - c));
+    return add(add(term1, term2), term3);
 }
 
-CameraBasis make_walk_basis(const PlanetPosition& radial_up,
-                            float yaw_radians,
-                            float pitch_radians) {
-    const WalkFrame frame = make_walk_frame(radial_up);
-    const float cos_yaw = std::cos(yaw_radians);
-    const float sin_yaw = std::sin(yaw_radians);
-    PlanetPosition forward_flat = normalized(add(scale(frame.tangent_z, cos_yaw),
-                                                 scale(frame.tangent_x, sin_yaw)));
-
-    const float cos_pitch = std::cos(pitch_radians);
-    const float sin_pitch = std::sin(pitch_radians);
-    PlanetPosition forward = normalized(add(scale(forward_flat, cos_pitch),
-                                            scale(radial_up, sin_pitch)));
-
-    CameraBasis basis{};
-    basis.forward = forward;
-    basis.up = radial_up;
-    basis.right = normalized(cross(basis.forward, basis.up));
-    if (metaral::core::length(basis.right) < 1e-6f) {
-        basis.right = {1.0f, 0.0f, 0.0f};
+PlanetPosition project_tangent(const PlanetPosition& v,
+                               const PlanetPosition& up) {
+    PlanetPosition tangent = sub(v, scale(up, dot(v, up)));
+    float len = metaral::core::length(tangent);
+    if (len < 1e-6f) {
+        PlanetPosition fallback{0.0f, 0.0f, 1.0f};
+        if (std::abs(dot(fallback, up)) > 0.95f) {
+            fallback = {1.0f, 0.0f, 0.0f};
+        }
+        tangent = sub(fallback, scale(up, dot(fallback, up)));
+        len = metaral::core::length(tangent);
+        if (len < 1e-6f) {
+            tangent = {1.0f, 0.0f, 0.0f};
+            len = metaral::core::length(tangent);
+        }
     }
-    return basis;
+    return scale(tangent, 1.0f / len);
 }
 
-struct WalkAngles {
-    float yaw = 0.0f;
-    float pitch = 0.0f;
-};
-
-WalkAngles derive_walk_angles(const PlanetPosition& forward,
-                              const PlanetPosition& radial_up) {
-    WalkAngles result{};
-    const WalkFrame frame = make_walk_frame(radial_up);
-    PlanetPosition forward_flat = sub(forward, scale(radial_up, dot(forward, radial_up)));
-    const float flat_len = metaral::core::length(forward_flat);
-    if (flat_len < 1e-6f) {
-        forward_flat = frame.tangent_z;
-    } else {
-        forward_flat = scale(forward_flat, 1.0f / flat_len);
-    }
-
-    const float z_proj = dot(forward_flat, frame.tangent_z);
-    const float x_proj = dot(forward_flat, frame.tangent_x);
-    result.yaw = std::atan2(x_proj, z_proj);
-    result.pitch = std::asin(std::clamp(dot(forward, radial_up), -1.0f, 1.0f));
-    return result;
+float surface_signed_distance(const PlanetPosition& pos, float planet_radius) {
+    const float len = metaral::core::length(pos);
+    const float wobble =
+        std::sin(pos.x * kTerrainNoiseFrequency) *
+        std::sin(pos.y * kTerrainNoiseFrequency) *
+        std::sin(pos.z * kTerrainNoiseFrequency);
+    return len - planet_radius + wobble * kTerrainNoiseAmplitude;
 }
 
 enum class MovementMode {
@@ -168,8 +145,6 @@ private:
     MovementMode mode_ = MovementMode::FreeFly;
     float yaw_freefly_ = 0.0f;
     float pitch_freefly_ = 0.0f;
-    float yaw_walk_ = 0.0f;
-    float pitch_walk_ = 0.0f;
     float walk_eye_height_m_ = 2.0f;
     float vertical_velocity_ = 0.0f;
 };
@@ -200,11 +175,6 @@ void VulkanViewer::on_init(const metaral::platform::AppInitContext& ctx) {
     yaw_freefly_ = std::atan2(initial_forward.z, initial_forward.x);
     pitch_freefly_ = std::asin(std::clamp(initial_forward.y, -1.0f, 1.0f));
 
-    const PlanetPosition radial_up = safe_radial_up(camera_.position);
-    const WalkAngles walk_angles = derive_walk_angles(initial_forward, radial_up);
-    yaw_walk_ = walk_angles.yaw;
-    pitch_walk_ = walk_angles.pitch;
-
     const CameraBasis basis = make_freefly_basis(yaw_freefly_, pitch_freefly_);
     camera_.forward = basis.forward;
     camera_.up = basis.up;
@@ -234,13 +204,17 @@ void VulkanViewer::on_frame(const metaral::platform::FrameContext& ctx) {
     if (ctx.input.key_tab_pressed) {
         if (mode_ == MovementMode::FreeFly) {
             mode_ = MovementMode::Walkabout;
-            const WalkAngles walk_angles = derive_walk_angles(camera_.forward, radial_up);
-            yaw_walk_ = walk_angles.yaw;
-            pitch_walk_ = std::clamp(walk_angles.pitch, -max_walk_pitch, max_walk_pitch);
             vertical_velocity_ = 0.0f;
             const float target_radius = coords_.planet_radius_m + walk_eye_height_m_;
             camera_.position = scale(radial_up, target_radius);
             radial_up = safe_radial_up(camera_.position);
+
+            PlanetPosition forward = camera_.forward;
+            if (metaral::core::length(forward) < 1e-6f) {
+                forward = {0.0f, 0.0f, 1.0f};
+            }
+            camera_.forward = project_tangent(forward, radial_up);
+            camera_.up = radial_up;
         } else {
             mode_ = MovementMode::FreeFly;
             yaw_freefly_ = std::atan2(camera_.forward.z, camera_.forward.x);
@@ -253,43 +227,61 @@ void VulkanViewer::on_frame(const metaral::platform::FrameContext& ctx) {
         const float yaw_delta = ctx.input.mouse_delta_x * mouse_sensitivity;
         const float pitch_delta = ctx.input.mouse_delta_y * mouse_sensitivity;
         if (mode_ == MovementMode::Walkabout) {
-            yaw_walk_   -= yaw_delta;
-            pitch_walk_ = std::clamp(pitch_walk_ - pitch_delta, -max_walk_pitch, max_walk_pitch);
+            PlanetPosition up = safe_radial_up(camera_.position);
+            PlanetPosition forward = camera_.forward;
+            if (metaral::core::length(forward) < 1e-6f) {
+                forward = {0.0f, 0.0f, 1.0f};
+            }
+
+            const float current_pitch = std::asin(std::clamp(dot(forward, up), -1.0f, 1.0f));
+            const float target_pitch = std::clamp(current_pitch - pitch_delta,
+                                                  -max_walk_pitch,
+                                                  max_walk_pitch);
+
+            PlanetPosition forward_flat = project_tangent(forward, up);
+            forward_flat = rotate_around_axis(forward_flat, up, -yaw_delta);
+
+            PlanetPosition new_forward =
+                normalized(add(scale(forward_flat, std::cos(target_pitch)),
+                               scale(up, std::sin(target_pitch))));
+            camera_.forward = new_forward;
+            camera_.up = up;
         } else {
             yaw_freefly_   -= yaw_delta;
             pitch_freefly_ = std::clamp(pitch_freefly_ - pitch_delta, -max_free_pitch, max_free_pitch);
         }
     }
 
-    CameraBasis basis = (mode_ == MovementMode::Walkabout)
-        ? make_walk_basis(radial_up, yaw_walk_, pitch_walk_)
-        : make_freefly_basis(yaw_freefly_, pitch_freefly_);
-
-    PlanetPosition forward = basis.forward;
-    PlanetPosition right = basis.right;
-    PlanetPosition camera_up = (mode_ == MovementMode::Walkabout) ? radial_up : basis.up;
-    camera_.forward = forward;
-    camera_.up = camera_up;
+    PlanetPosition forward{};
+    PlanetPosition right{};
+    PlanetPosition camera_up{};
+    if (mode_ == MovementMode::Walkabout) {
+        camera_up = safe_radial_up(camera_.position);
+        forward = camera_.forward;
+        if (metaral::core::length(forward) < 1e-6f) {
+            forward = {0.0f, 0.0f, 1.0f};
+        }
+        forward = normalized(forward);
+        right = normalized(cross(forward, camera_up));
+        if (metaral::core::length(right) < 1e-6f) {
+            right = project_tangent({1.0f, 0.0f, 0.0f}, camera_up);
+        }
+        camera_.forward = forward;
+        camera_.up = camera_up;
+    } else {
+        CameraBasis basis = make_freefly_basis(yaw_freefly_, pitch_freefly_);
+        forward = basis.forward;
+        right = basis.right;
+        camera_up = basis.up;
+        camera_.forward = forward;
+        camera_.up = camera_up;
+    }
 
     PlanetPosition move_forward = forward;
     PlanetPosition move_right = right;
     if (mode_ == MovementMode::Walkabout) {
-        const WalkFrame frame = make_walk_frame(radial_up);
-        move_forward = sub(move_forward, scale(radial_up, dot(move_forward, radial_up)));
-        const float forward_len = metaral::core::length(move_forward);
-        if (forward_len > 1e-6f) {
-            move_forward = scale(move_forward, 1.0f / forward_len);
-        } else {
-            move_forward = frame.tangent_z;
-        }
-
-        move_right = sub(move_right, scale(radial_up, dot(move_right, radial_up)));
-        const float right_len = metaral::core::length(move_right);
-        if (right_len > 1e-6f) {
-            move_right = scale(move_right, 1.0f / right_len);
-        } else {
-            move_right = frame.tangent_x;
-        }
+        move_forward = project_tangent(move_forward, camera_up);
+        move_right = project_tangent(move_right, camera_up);
     }
 
     PlanetPosition velocity{};
@@ -324,10 +316,9 @@ void VulkanViewer::on_frame(const metaral::platform::FrameContext& ctx) {
 
     if (mode_ == MovementMode::Walkabout) {
         radial_up = safe_radial_up(camera_.position);
-        const float desired_radius = coords_.planet_radius_m + walk_eye_height_m_;
-        const float radius = metaral::core::length(camera_.position);
-        const bool near_ground = std::abs(radius - desired_radius) < 0.1f;
-        const bool grounded = near_ground && vertical_velocity_ <= 0.0f;
+        const float desired_height = walk_eye_height_m_;
+        float surface_height = surface_signed_distance(camera_.position, coords_.planet_radius_m);
+        const bool grounded = surface_height <= desired_height + 0.05f && vertical_velocity_ <= 0.0f;
 
         if (ctx.input.key_space && grounded) {
             vertical_velocity_ = jump_speed;
@@ -338,10 +329,10 @@ void VulkanViewer::on_frame(const metaral::platform::FrameContext& ctx) {
         vertical_velocity_ += gravity_accel * dt;
         camera_.position = add(camera_.position, scale(radial_up, vertical_velocity_ * dt));
 
-        PlanetPosition current_radial = safe_radial_up(camera_.position);
-        const float new_radius = metaral::core::length(camera_.position);
-        if (new_radius < desired_radius) {
-            camera_.position = scale(current_radial, desired_radius);
+        surface_height = surface_signed_distance(camera_.position, coords_.planet_radius_m);
+        if (surface_height < desired_height) {
+            const float correction = desired_height - surface_height;
+            camera_.position = add(camera_.position, scale(radial_up, correction));
             vertical_velocity_ = 0.0f;
         }
     }
