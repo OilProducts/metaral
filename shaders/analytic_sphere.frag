@@ -11,7 +11,7 @@ layout(push_constant) uniform CameraParams {
     float gridDim;
     float gridVoxelSize;
     float gridHalfExtent;
-    float pad2;
+    float isoFraction;
 } uCamera;
 
 layout(std430, set = 0, binding = 0) readonly buffer SdfGrid {
@@ -96,11 +96,13 @@ bool march_sdf(vec3 ro, vec3 rd, out vec3 hitPos, out vec3 normal) {
     const float MAX_DIST  = 500.0;
     const float SURF_EPS  = 0.01;
     const float MIN_STEP  = 0.01;
+    float isoOffset = uCamera.isoFraction * uCamera.gridVoxelSize;
 
     float t = 0.0;
     for (int i = 0; i < MAX_STEPS; ++i) {
         vec3 p = ro + rd * t;
-        float d = sample_sdf(p);
+        float d_raw = sample_sdf(p);
+        float d = d_raw - isoOffset;
 
         if (d < SURF_EPS) {
             hitPos = p;

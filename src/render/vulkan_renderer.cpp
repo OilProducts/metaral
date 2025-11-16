@@ -848,7 +848,7 @@ struct CameraPush {
     float gridDim;
     float gridVoxelSize;
     float gridHalfExtent;
-    float pad2;
+    float isoFraction;    // fraction of gridVoxelSize used as SDF iso-offset
 };
 
 core::PlanetPosition normalize_vec(const core::PlanetPosition& v) {
@@ -924,6 +924,7 @@ void VulkanRenderer::draw_frame(const Camera& camera, const world::World& world)
     push.gridDim = static_cast<float>(impl_->sdf_dim);
     push.gridVoxelSize = impl_->sdf_voxel_size;
     push.gridHalfExtent = impl_->sdf_half_extent;
+    push.isoFraction = kDefaultSdfIsoFraction;
 
     // Record command buffer for this image
     VkCommandBuffer cmd = impl_->command_buffers[image_index];

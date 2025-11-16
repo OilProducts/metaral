@@ -141,12 +141,16 @@ float surface_signed_distance(const PlanetPosition& pos,
     constexpr float kSurfEpsilon = 0.01f;
     constexpr int   kMaxSteps    = 128;
 
+    const float iso_offset =
+        metaral::render::kDefaultSdfIsoFraction * grid.voxel_size;
     const float t = metaral::render::raymarch_sdf(grid,
                                                   pos,
                                                   down,
                                                   kMaxDist,
                                                   kSurfEpsilon,
-                                                  kMaxSteps);
+                                                  kMaxSteps,
+                                                  nullptr,
+                                                  iso_offset);
 
     if (t >= kMaxDist) {
         // Fallback to the analytic radial SDF when the grid does not provide
@@ -189,13 +193,22 @@ private:
 };
 
 void VulkanViewer::on_init(const metaral::platform::AppInitContext& ctx) {
-    coords_.voxel_size_m = 1.0f;
+    coords_.voxel_size_m = 0.5f;
     coords_.chunk_size = 32;
     coords_.planet_radius_m = 100.0f;
     coords_.planet_center_offset_voxels = {0, 0, 0};
 
     world_ = std::make_unique<metaral::world::World>(coords_);
-    metaral::world::terrain::generate_planet(*world_, 4, coords_);
+    // Generate enough chunks to cover the planet radius (in meters) plus a
+    // small margin, so that the voxel world fully contains the analytic
+    // terrain surface that the SDF grid will approximate.
+    const float meters_per_chunk =
+        coords_.voxel_size_m * static_cast<float>(coords_.chunk_size);
+    const float chunks_for_radius =
+        coords_.planet_radius_m / meters_per_chunk;
+    const int chunk_radius =
+        static_cast<int>(std::ceil(chunks_for_radius)) + 1; // one-chunk margin
+    metaral::world::terrain::generate_planet(*world_, chunk_radius, coords_);
 
     window_width_ = ctx.window_width;
     window_height_ = ctx.window_height;
@@ -258,11 +271,11 @@ void VulkanViewer::on_frame(const metaral::platform::FrameContext& ctx) {
     constexpr float kMaxBrushRadius = 20.0f;
     constexpr float kBrushStep = 0.5f;
 
-    if (ctx.input.key_plus_pressed) {
+    if (ctx.input.key_period_pressed) {
         brush_.radius_m = std::min(kMaxBrushRadius, brush_.radius_m + kBrushStep);
         std::cout << "Brush radius increased to " << brush_.radius_m << " m\n";
     }
-    if (ctx.input.key_minus_pressed) {
+    if (ctx.input.key_comma_pressed) {
         brush_.radius_m = std::max(kMinBrushRadius, brush_.radius_m - kBrushStep);
         std::cout << "Brush radius decreased to " << brush_.radius_m << " m\n";
     }
@@ -294,6 +307,8 @@ void VulkanViewer::on_frame(const metaral::platform::FrameContext& ctx) {
 
             PlanetPosition dir = normalized(camera_.forward);
             PlanetPosition hit_pos{};
+            const float iso_offset =
+                metaral::render::kDefaultSdfIsoFraction * grid->voxel_size;
             const bool hit = metaral::render::raycast_sdf(
                 *grid,
                 camera_.position,
@@ -301,7 +316,8 @@ void VulkanViewer::on_frame(const metaral::platform::FrameContext& ctx) {
                 kMaxDist,
                 kSurfEpsilon,
                 kMaxSteps,
-                hit_pos);
+                hit_pos,
+                iso_offset);
 
             if (hit) {
                 // Approximate surface normal by radial direction. This matches
@@ -402,6 +418,8 @@ void VulkanViewer::on_frame(const metaral::platform::FrameContext& ctx) {
             constexpr int   kMaxSteps = 128;
 
             PlanetPosition hit_pos{};
+            const float iso_offset =
+                metaral::render::kDefaultSdfIsoFraction * grid->voxel_size;
             const bool hit = metaral::render::raycast_sdf(
                 *grid,
                 camera_.position,
@@ -409,7 +427,8 @@ void VulkanViewer::on_frame(const metaral::platform::FrameContext& ctx) {
                 kMaxDist,
                 kSurfEpsilon,
                 kMaxSteps,
-                hit_pos);
+                hit_pos,
+                iso_offset);
 
             if (hit && world_) {
                 // Estimate SDF normal at the hit; this mirrors the GLSL

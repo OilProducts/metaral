@@ -200,6 +200,8 @@ struct LoopState {
     bool key_3_pressed = false;
     bool key_plus_pressed = false;
     bool key_minus_pressed = false;
+    bool key_comma_pressed = false;
+    bool key_period_pressed = false;
     bool key_bracket_left_pressed = false;
     bool key_bracket_right_pressed = false;
     bool key_f_pressed = false;
@@ -275,6 +277,16 @@ void handle_event(const Event& event, LoopState& state) {
         case SDLK_MINUS:
             if (!event.key.repeat) {
                 state.key_minus_pressed = true;
+            }
+            break;
+        case SDLK_COMMA:
+            if (!event.key.repeat) {
+                state.key_comma_pressed = true;
+            }
+            break;
+        case SDLK_PERIOD:
+            if (!event.key.repeat) {
+                state.key_period_pressed = true;
             }
             break;
         case SDLK_LEFTBRACKET:
@@ -394,6 +406,8 @@ int run_app(IApp& app, const WindowConfig& cfg) {
         state.key_3_pressed = false;
         state.key_plus_pressed = false;
         state.key_minus_pressed = false;
+        state.key_comma_pressed = false;
+        state.key_period_pressed = false;
         state.key_bracket_left_pressed = false;
         state.key_bracket_right_pressed = false;
 
@@ -423,6 +437,8 @@ int run_app(IApp& app, const WindowConfig& cfg) {
         frame_input.key_3_pressed = state.key_3_pressed;
         frame_input.key_plus_pressed = state.key_plus_pressed;
         frame_input.key_minus_pressed = state.key_minus_pressed;
+        frame_input.key_comma_pressed = state.key_comma_pressed;
+        frame_input.key_period_pressed = state.key_period_pressed;
         frame_input.key_bracket_left_pressed = state.key_bracket_left_pressed;
         frame_input.key_bracket_right_pressed = state.key_bracket_right_pressed;
         frame_input.mouse_left_button = state.mouse_left_button;
