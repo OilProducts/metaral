@@ -190,6 +190,7 @@ private:
     float pitch_freefly_ = 0.0f;
     float walk_eye_height_m_ = 2.0f;
     float vertical_velocity_ = 0.0f;
+    float brush_cooldown_s_ = 0.0f;
 };
 
 void VulkanViewer::on_init(const metaral::platform::AppInitContext& ctx) {
@@ -298,7 +299,14 @@ void VulkanViewer::on_frame(const metaral::platform::FrameContext& ctx) {
 
     // Tool fire: left mouse button. This computes the hit, applies the brush
     // to voxels, tracks a dirty SDF region, and logs debug info.
-    if (ctx.input.mouse_left_button && renderer_) {
+    // Update brush cooldown timer (seconds).
+    brush_cooldown_s_ = std::max(0.0f, brush_cooldown_s_ - ctx.dt_seconds);
+
+    // Tool fire: left mouse button, rate-limited by a small cooldown so that
+    // continuous editing does not apply hundreds of brush operations per
+    // second. Currently limited to once every 0.1 seconds.
+    constexpr float kBrushCooldownSeconds = 0.1f; // 100 ms
+    if (ctx.input.mouse_left_button && renderer_ && brush_cooldown_s_ <= 0.0f) {
         const metaral::render::SdfGrid* grid = renderer_->sdf_grid();
         if (grid) {
             constexpr float kMaxDist = 1000.0f;
@@ -402,6 +410,9 @@ void VulkanViewer::on_frame(const metaral::platform::FrameContext& ctx) {
         } else {
             std::cout << "Tool fired but SDF grid not built yet\n";
         }
+
+        // Enforce the brush cooldown after any attempt to fire the tool.
+        brush_cooldown_s_ = kBrushCooldownSeconds;
     }
 
     if (ctx.input.key_f_pressed && renderer_) {
