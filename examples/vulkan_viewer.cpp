@@ -139,7 +139,7 @@ float surface_signed_distance(const PlanetPosition& pos,
 
     constexpr float kMaxDist     = 500.0f;
     constexpr float kSurfEpsilon = 0.01f;
-    constexpr int   kMaxSteps    = 128;
+    constexpr int   kMaxSteps    = 192;
 
     const float iso_offset =
         metaral::render::kDefaultSdfIsoFraction * grid.voxel_size;
@@ -303,7 +303,7 @@ void VulkanViewer::on_frame(const metaral::platform::FrameContext& ctx) {
         if (grid) {
             constexpr float kMaxDist = 1000.0f;
             constexpr float kSurfEpsilon = 0.05f;
-            constexpr int   kMaxSteps = 128;
+            constexpr int   kMaxSteps = 192;
 
             PlanetPosition dir = normalized(camera_.forward);
             PlanetPosition hit_pos{};
@@ -415,7 +415,7 @@ void VulkanViewer::on_frame(const metaral::platform::FrameContext& ctx) {
             // converting to a voxel coordinate.
             constexpr float kMaxDist = 500.0f;
             constexpr float kSurfEpsilon = 0.01f;
-            constexpr int   kMaxSteps = 128;
+            constexpr int   kMaxSteps = 192;
 
             PlanetPosition hit_pos{};
             const float iso_offset =

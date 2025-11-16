@@ -479,6 +479,10 @@ float raymarch_sdf(const SdfGrid& grid,
 {
     float t = 0.0f;
 
+    float best_abs_d = std::numeric_limits<float>::infinity();
+    float best_t = 0.0f;
+    core::PlanetPosition best_pos{};
+
     for (int i = 0; i < max_steps; ++i) {
         core::PlanetPosition p{
             ray_origin.x + ray_dir.x * t,
@@ -488,6 +492,14 @@ float raymarch_sdf(const SdfGrid& grid,
 
         const float d_raw = sample_sdf(grid, p);
         const float d = d_raw - iso_offset;
+
+        const float abs_d = std::fabs(d);
+        if (abs_d < best_abs_d) {
+            best_abs_d = abs_d;
+            best_pos = p;
+            best_t = t;
+        }
+
         if (d < surf_epsilon) {
             if (out_hit_pos) {
                 *out_hit_pos = p;
@@ -496,11 +508,24 @@ float raymarch_sdf(const SdfGrid& grid,
         }
 
         constexpr float kMinStep = 0.01f;
-        const float step = std::max(d, kMinStep);
+        constexpr float kStepSafety = 0.8f;
+        const float step = std::max(d * kStepSafety, kMinStep);
         t += step;
         if (t > max_dist) {
             break;
         }
+    }
+
+    // If we didn't register a proper hit but passed very close to the
+    // surface, treat the closest approach as a hit. This helps avoid
+    // "leaking" background pixels at grazing angles.
+    const float near_miss_epsilon =
+        std::max(surf_epsilon * 2.0f, 0.25f * grid.voxel_size);
+    if (best_abs_d < near_miss_epsilon && best_t <= max_dist) {
+        if (out_hit_pos) {
+            *out_hit_pos = best_pos;
+        }
+        return best_t;
     }
 
     return max_dist;

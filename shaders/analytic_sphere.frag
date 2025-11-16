@@ -91,18 +91,58 @@ vec3 estimate_normal(vec3 p) {
     return normalize(vec3(dx, dy, dz));
 }
 
+// Simple hemisphere ambient: blend between a ground color and a sky color
+// based on the up component of the normal.
+vec3 hemisphere_ambient(vec3 n) {
+    float t = clamp(n.y * 0.5 + 0.5, 0.0, 1.0);
+    vec3 skyColor    = vec3(0.25, 0.35, 0.55);
+    vec3 groundColor = vec3(0.05, 0.03, 0.02);
+    return mix(groundColor, skyColor, t);
+}
+
+// Cheap ambient occlusion approximation using a few SDF samples along the
+// normal. Concave regions accumulate more occlusion.
+float calc_ao(vec3 p, vec3 n) {
+    float ao = 0.0;
+    float sca = 1.0;
+    // Step size in meters; proportional to voxel size.
+    float baseStep = 0.75 * uCamera.gridVoxelSize;
+
+    for (int i = 0; i < 4; ++i) {
+        float h = baseStep * (1.0 + float(i));
+        float d = sample_sdf(p + n * h);
+        // If d is smaller than the sampling distance h, treat it as occlusion.
+        float delta = max(0.0, h - d);
+        ao += delta * sca;
+        sca *= 0.7;
+    }
+
+    // Scale and invert to [0,1].
+    return clamp(1.0 - 1.5 * ao, 0.0, 1.0);
+}
+
 bool march_sdf(vec3 ro, vec3 rd, out vec3 hitPos, out vec3 normal) {
-    const int   MAX_STEPS = 128;
+    const int   MAX_STEPS = 192;
     const float MAX_DIST  = 500.0;
     const float SURF_EPS  = 0.01;
     const float MIN_STEP  = 0.01;
+    const float STEP_SAFETY = 0.8;
     float isoOffset = uCamera.isoFraction * uCamera.gridVoxelSize;
 
     float t = 0.0;
+    float bestAbsD = 1e30;
+    vec3  bestPos  = ro;
+
     for (int i = 0; i < MAX_STEPS; ++i) {
         vec3 p = ro + rd * t;
         float d_raw = sample_sdf(p);
         float d = d_raw - isoOffset;
+
+        float absD = abs(d);
+        if (absD < bestAbsD) {
+            bestAbsD = absD;
+            bestPos = p;
+        }
 
         if (d < SURF_EPS) {
             hitPos = p;
@@ -110,11 +150,21 @@ bool march_sdf(vec3 ro, vec3 rd, out vec3 hitPos, out vec3 normal) {
             return true;
         }
 
-        float step = max(d, MIN_STEP);
+        float step = max(d * STEP_SAFETY, MIN_STEP);
         t += step;
         if (t > MAX_DIST) {
             break;
         }
+    }
+
+    // Near-miss fallback: if we passed very close to the surface without
+    // formally hitting it, treat the closest approach as a hit. This helps
+    // avoid background pixels at grazing angles.
+    float nearMissEps = max(SURF_EPS * 2.0, 0.25 * uCamera.gridVoxelSize);
+    if (bestAbsD < nearMissEps) {
+        hitPos = bestPos;
+        normal = estimate_normal(bestPos);
+        return true;
     }
     return false;
 }
@@ -130,7 +180,8 @@ void main() {
     }
 
     vec3 lightDir = normalize(vec3(0.3, 0.8, 0.4));
-    float ndotl = max(dot(n, lightDir), 0.0);
+    vec3 viewDir  = normalize(uCamera.camPos - p);
+    float ndotl   = max(dot(n, lightDir), 0.0);
 
     // Use height above the nominal radius (based on the
     // perturbed SDF) to add color variation.
@@ -144,7 +195,23 @@ void main() {
     vec3 baseColor = mix(lowColor, midColor, hNorm);
     baseColor = mix(baseColor, highColor, smoothstep(0.6, 1.0, hNorm));
 
-    vec3 color = baseColor * (0.25 + 0.75 * ndotl);
+    // Ambient term with simple AO.
+    float ao     = calc_ao(p, n);
+    vec3 ambient = hemisphere_ambient(n) * 0.4 * ao;
+
+    // Lambertian diffuse.
+    vec3 diffuse = baseColor * ndotl;
+
+    // Blinn-Phong specular highlight.
+    float spec = 0.0;
+    if (ndotl > 0.0) {
+        vec3 h = normalize(lightDir + viewDir);
+        float ndoth = max(dot(n, h), 0.0);
+        spec = pow(ndoth, 32.0);
+    }
+    vec3 specular = vec3(1.0) * spec * 0.25;
+
+    vec3 color = ambient + diffuse * 0.9 * ao + specular;
 
     outColor = vec4(color, 1.0);
 }
