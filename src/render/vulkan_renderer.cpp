@@ -346,6 +346,19 @@ VkShaderModule create_shader_module(VkDevice device, const char* path) {
     return module;
 }
 
+struct CameraPush {
+    float camPos[3];      float planetRadius;
+    float forward[3];     float fovY;
+    float right[3];       float aspect;
+    float up[3];          float pad1;
+    float gridDim;
+    float gridVoxelSize;
+    float gridHalfExtent;
+    float isoFraction;    // fraction of gridVoxelSize used as SDF iso-offset
+    float sunDirection[3]; float sunIntensity;
+    float sunColor[3];     float pad2;
+};
+
 void create_pipeline(Impl& impl) {
     VkDescriptorSetLayoutBinding bindings[2]{};
 
@@ -372,11 +385,11 @@ void create_pipeline(Impl& impl) {
                                          &impl.descriptor_set_layout),
              "vkCreateDescriptorSetLayout");
 
-    // Push constant block layout: CameraParams
+    // Push constant block layout: CameraParams (CameraPush on the C++ side)
     VkPushConstantRange range{};
     range.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
     range.offset = 0;
-    range.size = sizeof(float) * 4 * 5; // 5 vec4s
+    range.size = sizeof(CameraPush);
 
     VkPipelineLayoutCreateInfo layout_info{};
     layout_info.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
@@ -840,17 +853,6 @@ void VulkanRenderer::resize(std::uint32_t width, std::uint32_t height) {
     create_image_views(*impl_);
     create_framebuffers(*impl_);
 }
-struct CameraPush {
-    float camPos[3];      float planetRadius;
-    float forward[3];     float fovY;
-    float right[3];       float aspect;
-    float up[3];          float pad1;
-    float gridDim;
-    float gridVoxelSize;
-    float gridHalfExtent;
-    float isoFraction;    // fraction of gridVoxelSize used as SDF iso-offset
-};
-
 core::PlanetPosition normalize_vec(const core::PlanetPosition& v) {
     const float len = metaral::core::length(v);
     if (len < 1e-6f) {
@@ -925,6 +927,20 @@ void VulkanRenderer::draw_frame(const Camera& camera, const world::World& world)
     push.gridVoxelSize = impl_->sdf_voxel_size;
     push.gridHalfExtent = impl_->sdf_half_extent;
     push.isoFraction = kDefaultSdfIsoFraction;
+
+    // Simple directional "sun" light expressed in planetary/world space.
+    core::PlanetPosition sun_dir_ws{0.3f, 0.8f, 0.4f};
+    sun_dir_ws = normalize_vec(sun_dir_ws);
+    push.sunDirection[0] = sun_dir_ws.x;
+    push.sunDirection[1] = sun_dir_ws.y;
+    push.sunDirection[2] = sun_dir_ws.z;
+    push.sunIntensity = 1.0f;
+
+    // Slightly warm sun color.
+    push.sunColor[0] = 1.0f;
+    push.sunColor[1] = 0.98f;
+    push.sunColor[2] = 0.92f;
+    push.pad2 = 0.0f;
 
     // Record command buffer for this image
     VkCommandBuffer cmd = impl_->command_buffers[image_index];

@@ -12,6 +12,8 @@ layout(push_constant) uniform CameraParams {
     float gridVoxelSize;
     float gridHalfExtent;
     float isoFraction;
+    vec3 sunDirection; float sunIntensity;
+    vec3 sunColor;     float pad2;
 } uCamera;
 
 layout(std430, set = 0, binding = 0) readonly buffer SdfGrid {
@@ -179,7 +181,7 @@ void main() {
         return;
     }
 
-    vec3 lightDir = normalize(vec3(0.3, 0.8, 0.4));
+    vec3 lightDir = normalize(uCamera.sunDirection);
     vec3 viewDir  = normalize(uCamera.camPos - p);
     float ndotl   = max(dot(n, lightDir), 0.0);
 
@@ -200,7 +202,7 @@ void main() {
     vec3 ambient = hemisphere_ambient(n) * 0.4 * ao;
 
     // Lambertian diffuse.
-    vec3 diffuse = baseColor * ndotl;
+    vec3 diffuse = baseColor * ndotl * uCamera.sunIntensity;
 
     // Blinn-Phong specular highlight.
     float spec = 0.0;
@@ -209,7 +211,7 @@ void main() {
         float ndoth = max(dot(n, h), 0.0);
         spec = pow(ndoth, 32.0);
     }
-    vec3 specular = vec3(1.0) * spec * 0.25;
+    vec3 specular = uCamera.sunColor * spec * 0.25 * uCamera.sunIntensity;
 
     vec3 color = ambient + diffuse * 0.9 * ao + specular;
 
