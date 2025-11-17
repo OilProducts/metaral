@@ -2,6 +2,7 @@
 
 #include "metaral/world/chunk.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <limits>
 #include <queue>
@@ -43,6 +44,17 @@ inline void decode_linear_index(std::uint32_t dim,
     const std::uint32_t rem = index % slice;
     y = rem / dim;
     x = rem % dim;
+}
+
+inline float dot3(const core::PlanetPosition& a,
+                  const core::PlanetPosition& b) noexcept
+{
+    return a.x * b.x + a.y * b.y + a.z * b.z;
+}
+
+inline float length_squared(const core::PlanetPosition& v) noexcept
+{
+    return dot3(v, v);
 }
 
 struct DistanceNode {
@@ -477,7 +489,47 @@ float raymarch_sdf(const SdfGrid& grid,
                    core::PlanetPosition* out_hit_pos,
                    float iso_offset)
 {
+    const float original_max_dist = max_dist;
     float t = 0.0f;
+
+    const float boundary_radius = grid.half_extent;
+    if (boundary_radius > 0.0f) {
+        const float dir_len_sq = length_squared(ray_dir);
+        if (dir_len_sq > 0.0f) {
+            const float radius_sq = boundary_radius * boundary_radius;
+            const float origin_len_sq = length_squared(ray_origin);
+            const float c = origin_len_sq - radius_sq;
+            const bool origin_outside = c > 0.0f;
+            const float b = 2.0f * dot3(ray_origin, ray_dir);
+            const float discriminant = b * b - 4.0f * dir_len_sq * c;
+
+            if (discriminant < 0.0f) {
+                if (origin_outside) {
+                    return original_max_dist;
+                }
+            } else {
+                const float sqrt_disc = std::sqrt(discriminant);
+                const float inv_denom = 0.5f / dir_len_sq;
+                float entry = (-b - sqrt_disc) * inv_denom;
+                float exit = (-b + sqrt_disc) * inv_denom;
+                if (entry > exit) {
+                    const float tmp = entry;
+                    entry = exit;
+                    exit = tmp;
+                }
+
+                if (origin_outside) {
+                    if (exit < 0.0f) {
+                        return original_max_dist;
+                    }
+                    t = std::max(entry, 0.0f);
+                    if (t > max_dist) {
+                        return original_max_dist;
+                    }
+                }
+            }
+        }
+    }
 
     float best_abs_d = std::numeric_limits<float>::infinity();
     float best_t = 0.0f;
@@ -528,7 +580,7 @@ float raymarch_sdf(const SdfGrid& grid,
         return best_t;
     }
 
-    return max_dist;
+    return original_max_dist;
 }
 
 bool raycast_sdf(const SdfGrid& grid,

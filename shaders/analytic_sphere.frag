@@ -37,6 +37,37 @@ vec3 ray_direction(vec2 uv) {
     return dir;
 }
 
+bool ray_sphere_bounds(vec3 ro,
+                       vec3 rd,
+                       float radius,
+                       out float tEnter,
+                       out float tExit) {
+    float a = dot(rd, rd);
+    if (a <= 0.0) {
+        tEnter = 0.0;
+        tExit = 0.0;
+        return false;
+    }
+
+    float b = 2.0 * dot(ro, rd);
+    float c = dot(ro, ro) - radius * radius;
+    float disc = b * b - 4.0 * a * c;
+    if (disc < 0.0) {
+        return false;
+    }
+
+    float s = sqrt(disc);
+    float inv = 0.5 / a;
+    tEnter = (-b - s) * inv;
+    tExit  = (-b + s) * inv;
+    if (tEnter > tExit) {
+        float tmp = tEnter;
+        tEnter = tExit;
+        tExit = tmp;
+    }
+    return true;
+}
+
 float sample_sdf(vec3 p) {
     float halfExtent = uCamera.gridHalfExtent;
     float dim = uCamera.gridDim;
@@ -125,15 +156,34 @@ float calc_ao(vec3 p, vec3 n) {
 
 bool march_sdf(vec3 ro, vec3 rd, out vec3 hitPos, out vec3 normal) {
     const int   MAX_STEPS = 192;
-    const float MAX_DIST  = 500.0;
     const float SURF_EPS  = 0.01;
     const float MIN_STEP  = 0.01;
     const float STEP_SAFETY = 0.8;
     float isoOffset = uCamera.isoFraction * uCamera.gridVoxelSize;
 
+    float boundaryRadius = uCamera.gridHalfExtent;
+
     float t = 0.0;
+    if (boundaryRadius > 0.0) {
+        float tEnter, tExit;
+        bool hitSphere = ray_sphere_bounds(ro, rd, boundaryRadius, tEnter, tExit);
+        float radiusSq = boundaryRadius * boundaryRadius;
+        float originSq = dot(ro, ro);
+        bool outside = originSq > radiusSq;
+
+        if (outside) {
+            if (!hitSphere || tExit < 0.0) {
+                return false;
+            }
+            t = max(tEnter, 0.0);
+        } else if (!hitSphere) {
+            // Inside the volume but ray never exits; no need to adjust t.
+        }
+    }
+
     float bestAbsD = 1e30;
     vec3  bestPos  = ro;
+    float bestT    = 0.0;
 
     for (int i = 0; i < MAX_STEPS; ++i) {
         vec3 p = ro + rd * t;
@@ -144,6 +194,7 @@ bool march_sdf(vec3 ro, vec3 rd, out vec3 hitPos, out vec3 normal) {
         if (absD < bestAbsD) {
             bestAbsD = absD;
             bestPos = p;
+            bestT = t;
         }
 
         if (d < SURF_EPS) {
@@ -154,9 +205,6 @@ bool march_sdf(vec3 ro, vec3 rd, out vec3 hitPos, out vec3 normal) {
 
         float step = max(d * STEP_SAFETY, MIN_STEP);
         t += step;
-        if (t > MAX_DIST) {
-            break;
-        }
     }
 
     // Near-miss fallback: if we passed very close to the surface without
