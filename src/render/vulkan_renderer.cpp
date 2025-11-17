@@ -7,6 +7,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <functional>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -62,6 +63,7 @@ struct VulkanRenderer::Impl {
     bool sdf_dirty = false; // indicates whether a dirty region is pending
     core::PlanetPosition dirty_min{};
     core::PlanetPosition dirty_max{};
+    std::function<void(VkCommandBuffer)> overlay_callback;
 };
 
 namespace {
@@ -981,6 +983,9 @@ void VulkanRenderer::draw_frame(const Camera& camera, const world::World& world)
                        sizeof(CameraPush),
                        &push);
     vkCmdDraw(cmd, 3, 1, 0, 0);
+    if (impl_->overlay_callback) {
+        impl_->overlay_callback(cmd);
+    }
     vkCmdEndRenderPass(cmd);
 
     vk_check(vkEndCommandBuffer(cmd), "vkEndCommandBuffer");
@@ -1028,6 +1033,25 @@ const SdfGrid* VulkanRenderer::sdf_grid() const {
         return nullptr;
     }
     return &impl_->sdf_grid;
+}
+
+VulkanBackendHandles VulkanRenderer::backend_handles() const {
+    VulkanBackendHandles handles{};
+    handles.instance = impl_->instance;
+    handles.physical_device = impl_->physical_device;
+    handles.device = impl_->device;
+    handles.graphics_queue = impl_->graphics_queue;
+    handles.graphics_queue_family = impl_->graphics_queue_family;
+    handles.render_pass = impl_->render_pass;
+    handles.swapchain_image_count = static_cast<uint32_t>(impl_->swapchain_images.size());
+    return handles;
+}
+
+void VulkanRenderer::set_overlay_callback(OverlayCallback callback) {
+    if (!impl_) {
+        return;
+    }
+    impl_->overlay_callback = std::move(callback);
 }
 
 void VulkanRenderer::wait_idle() {

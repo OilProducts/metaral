@@ -8,15 +8,31 @@
 #include "metaral/world/world.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
+#include <cstdint>
 #include <iostream>
 #include <memory>
+#include <stdexcept>
+#include <string>
 
 #ifdef METARAL_ENABLE_VULKAN
+
+#include <SDL3/SDL.h>
+
+#include <imgui.h>
+#include <backends/imgui_impl_sdl3.h>
+#include <backends/imgui_impl_vulkan.h>
 
 namespace {
 
 using metaral::core::PlanetPosition;
+
+void check_vk_result(VkResult result, const char* what) {
+    if (result != VK_SUCCESS) {
+        throw std::runtime_error(std::string("Vulkan error in ") + what + ": " + std::to_string(result));
+    }
+}
 
 struct Brush {
     float radius_m = 2.0f;
@@ -191,6 +207,18 @@ private:
     float walk_eye_height_m_ = 2.0f;
     float vertical_velocity_ = 0.0f;
     float brush_cooldown_s_ = 0.0f;
+    bool imgui_initialized_ = false;
+    bool imgui_backend_ready_ = false;
+    VkDescriptorPool imgui_descriptor_pool_ = VK_NULL_HANDLE;
+    VkDevice imgui_device_ = VK_NULL_HANDLE;
+
+    void initialize_imgui(const metaral::platform::AppInitContext& ctx);
+    void recreate_imgui_backend();
+    void shutdown_imgui();
+    void begin_imgui_frame(const metaral::platform::FrameContext& ctx);
+    void render_imgui_overlay();
+    void upload_imgui_fonts(const metaral::render::VulkanBackendHandles& handles);
+    void setup_imgui_vulkan_backend(const metaral::render::VulkanBackendHandles& handles);
 };
 
 void VulkanViewer::on_init(const metaral::platform::AppInitContext& ctx) {
@@ -231,6 +259,12 @@ void VulkanViewer::on_init(const metaral::platform::AppInitContext& ctx) {
     const CameraBasis basis = make_freefly_basis(yaw_freefly_, pitch_freefly_);
     camera_.forward = basis.forward;
     camera_.up = basis.up;
+
+    try {
+        initialize_imgui(ctx);
+    } catch (const std::exception& e) {
+        std::cerr << "Failed to initialize ImGui: " << e.what() << "\n";
+    }
 }
 
 void VulkanViewer::on_frame(const metaral::platform::FrameContext& ctx) {
@@ -637,11 +671,22 @@ void VulkanViewer::on_frame(const metaral::platform::FrameContext& ctx) {
         }
     }
 
+    if (imgui_initialized_ && imgui_backend_ready_) {
+        begin_imgui_frame(ctx);
+        render_imgui_overlay();
+        ImGui::Render();
+    }
+
     if (ctx.input.window_resized || ctx.window_width != window_width_ || ctx.window_height != window_height_) {
         window_width_ = ctx.window_width;
         window_height_ = ctx.window_height;
         renderer_->resize(static_cast<std::uint32_t>(window_width_),
                           static_cast<std::uint32_t>(window_height_));
+        try {
+            recreate_imgui_backend();
+        } catch (const std::exception& e) {
+            std::cerr << "Failed to recreate ImGui backend: " << e.what() << "\n";
+        }
     }
 
     renderer_->draw_frame(camera_, *world_);
@@ -650,9 +695,179 @@ void VulkanViewer::on_frame(const metaral::platform::FrameContext& ctx) {
 void VulkanViewer::on_shutdown() {
     if (renderer_) {
         renderer_->wait_idle();
-        renderer_.reset();
     }
+    shutdown_imgui();
+    renderer_.reset();
     world_.reset();
+}
+
+void VulkanViewer::initialize_imgui(const metaral::platform::AppInitContext& ctx) {
+    if (imgui_initialized_ || !renderer_) {
+        return;
+    }
+
+    SDL_Window* window = static_cast<SDL_Window*>(ctx.native_window);
+    if (!window) {
+        throw std::runtime_error("SDL window handle unavailable for ImGui initialization");
+    }
+
+    const auto handles = renderer_->backend_handles();
+    if (handles.device == VK_NULL_HANDLE || handles.render_pass == VK_NULL_HANDLE) {
+        throw std::runtime_error("Renderer backend handles not ready for ImGui");
+    }
+
+    imgui_device_ = handles.device;
+
+    IMGUI_CHECKVERSION();
+    ImGui::CreateContext();
+    ImGui::StyleColorsDark();
+
+    std::array<VkDescriptorPoolSize, 11> pool_sizes{{
+        VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_SAMPLER, 1000},
+        VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1000},
+        VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1000},
+        VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1000},
+        VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER, 1000},
+        VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER, 1000},
+        VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1000},
+        VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1000},
+        VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 1000},
+        VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC, 1000},
+        VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT, 1000},
+    }};
+
+    VkDescriptorPoolCreateInfo pool_info{};
+    pool_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+    pool_info.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
+    pool_info.maxSets = 1000 * static_cast<std::uint32_t>(pool_sizes.size());
+    pool_info.poolSizeCount = static_cast<std::uint32_t>(pool_sizes.size());
+    pool_info.pPoolSizes = pool_sizes.data();
+
+    check_vk_result(vkCreateDescriptorPool(handles.device, &pool_info, nullptr, &imgui_descriptor_pool_),
+                    "vkCreateDescriptorPool (ImGui)");
+
+    if (!ImGui_ImplSDL3_InitForVulkan(window)) {
+        throw std::runtime_error("ImGui_ImplSDL3_InitForVulkan failed");
+    }
+
+    try {
+        setup_imgui_vulkan_backend(handles);
+        imgui_initialized_ = true;
+    } catch (...) {
+        ImGui_ImplSDL3_Shutdown();
+        ImGui::DestroyContext();
+        if (imgui_descriptor_pool_ != VK_NULL_HANDLE) {
+            vkDestroyDescriptorPool(handles.device, imgui_descriptor_pool_, nullptr);
+            imgui_descriptor_pool_ = VK_NULL_HANDLE;
+        }
+        imgui_device_ = VK_NULL_HANDLE;
+        throw;
+    }
+}
+
+void VulkanViewer::setup_imgui_vulkan_backend(const metaral::render::VulkanBackendHandles& handles) {
+    if (imgui_descriptor_pool_ == VK_NULL_HANDLE) {
+        throw std::runtime_error("ImGui descriptor pool not initialized");
+    }
+
+    ImGui_ImplVulkan_InitInfo init_info{};
+    init_info.Instance = handles.instance;
+    init_info.PhysicalDevice = handles.physical_device;
+    init_info.Device = handles.device;
+    init_info.QueueFamily = handles.graphics_queue_family;
+    init_info.Queue = handles.graphics_queue;
+    init_info.PipelineCache = VK_NULL_HANDLE;
+    init_info.DescriptorPool = imgui_descriptor_pool_;
+    init_info.Subpass = 0;
+    init_info.MinImageCount = std::max(handles.swapchain_image_count, 2u);
+    init_info.ImageCount = std::max(handles.swapchain_image_count, 2u);
+    init_info.MSAASamples = VK_SAMPLE_COUNT_1_BIT;
+    init_info.Allocator = nullptr;
+    init_info.CheckVkResultFn = nullptr;
+
+    init_info.RenderPass = handles.render_pass;
+    if (!ImGui_ImplVulkan_Init(&init_info)) {
+        throw std::runtime_error("ImGui_ImplVulkan_Init failed");
+    }
+    upload_imgui_fonts(handles);
+
+    renderer_->set_overlay_callback([](VkCommandBuffer cmd) {
+        ImDrawData* draw_data = ImGui::GetDrawData();
+        if (!draw_data || draw_data->CmdListsCount == 0) {
+            return;
+        }
+        ImGui_ImplVulkan_RenderDrawData(draw_data, cmd);
+    });
+
+    imgui_backend_ready_ = true;
+}
+
+void VulkanViewer::recreate_imgui_backend() {
+    if (!imgui_initialized_) {
+        return;
+    }
+    if (imgui_backend_ready_) {
+        renderer_->set_overlay_callback({});
+        ImGui_ImplVulkan_Shutdown();
+        imgui_backend_ready_ = false;
+    }
+    const auto handles = renderer_->backend_handles();
+    setup_imgui_vulkan_backend(handles);
+}
+
+void VulkanViewer::begin_imgui_frame(const metaral::platform::FrameContext& ctx) {
+    ImGui_ImplSDL3_NewFrame();
+    ImGui_ImplVulkan_NewFrame();
+    ImGuiIO& io = ImGui::GetIO();
+    io.DisplaySize = ImVec2(static_cast<float>(ctx.window_width), static_cast<float>(ctx.window_height));
+    io.DeltaTime = std::max(1e-4f, ctx.dt_seconds);
+    ImGui::NewFrame();
+}
+
+void VulkanViewer::render_imgui_overlay() {
+    const ImGuiWindowFlags flags =
+        ImGuiWindowFlags_AlwaysAutoResize |
+        ImGuiWindowFlags_NoDecoration |
+        ImGuiWindowFlags_NoSavedSettings |
+        ImGuiWindowFlags_NoMove |
+        ImGuiWindowFlags_NoFocusOnAppearing |
+        ImGuiWindowFlags_NoNav;
+
+    ImGui::SetNextWindowBgAlpha(0.35f);
+    ImGui::SetNextWindowPos(ImVec2(10.0f, 10.0f), ImGuiCond_Always);
+    ImGui::Begin("##metaral_stats", nullptr, flags);
+    const ImGuiIO& io = ImGui::GetIO();
+    ImGui::Text("FPS: %.1f", io.Framerate);
+    ImGui::End();
+}
+
+void VulkanViewer::upload_imgui_fonts(const metaral::render::VulkanBackendHandles& handles) {
+    (void)handles;
+    if (!ImGui_ImplVulkan_CreateFontsTexture()) {
+        throw std::runtime_error("ImGui_ImplVulkan_CreateFontsTexture failed");
+    }
+}
+
+void VulkanViewer::shutdown_imgui() {
+    if (!imgui_initialized_) {
+        return;
+    }
+
+    renderer_->set_overlay_callback({});
+    if (imgui_backend_ready_) {
+        ImGui_ImplVulkan_Shutdown();
+        imgui_backend_ready_ = false;
+    }
+    ImGui_ImplSDL3_Shutdown();
+    ImGui::DestroyContext();
+
+    if (imgui_descriptor_pool_ != VK_NULL_HANDLE && imgui_device_ != VK_NULL_HANDLE) {
+        vkDestroyDescriptorPool(imgui_device_, imgui_descriptor_pool_, nullptr);
+    }
+
+    imgui_descriptor_pool_ = VK_NULL_HANDLE;
+    imgui_device_ = VK_NULL_HANDLE;
+    imgui_initialized_ = false;
 }
 
 } // namespace

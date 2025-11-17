@@ -10,6 +10,7 @@
 #endif
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 
 namespace metaral::render {
@@ -21,6 +22,18 @@ struct SdfGridInfo {
     float voxel_size = 0.0f;
     float half_extent = 0.0f;
 };
+
+struct VulkanBackendHandles {
+    VkInstance instance = VK_NULL_HANDLE;
+    VkPhysicalDevice physical_device = VK_NULL_HANDLE;
+    VkDevice device = VK_NULL_HANDLE;
+    VkQueue graphics_queue = VK_NULL_HANDLE;
+    uint32_t graphics_queue_family = 0;
+    VkRenderPass render_pass = VK_NULL_HANDLE;
+    uint32_t swapchain_image_count = 0;
+};
+
+using OverlayCallback = std::function<void(VkCommandBuffer)>;
 
 // Very small, initial Vulkan renderer stub.
 // Goal: own a Vulkan device + swapchain and be able to render
@@ -48,6 +61,9 @@ public:
 
     SdfGridInfo sdf_grid_info() const;
     const SdfGrid* sdf_grid() const;
+    VulkanBackendHandles backend_handles() const;
+
+    void set_overlay_callback(OverlayCallback callback);
 
     struct Impl;
 
