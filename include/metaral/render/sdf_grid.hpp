@@ -20,6 +20,7 @@ struct SdfGrid {
     float voxel_size = 0.0f;     // meters between samples
     float half_extent = 0.0f;    // grid spans [-half_extent, +half_extent] in each axis
     float planet_radius = 0.0f;  // for out-of-bounds fallback
+    bool has_octree = false;     // indicates whether an acceleration structure is available
 };
 
 void build_sdf_grid_from_world(const world::World& world,
