@@ -425,11 +425,37 @@ void FluidComputeContext::step(VkCommandBuffer cmd,
         vkCmdDispatch(cmd, groups, 1, 1);
     };
 
+    auto barrier_buffers = [&](std::initializer_list<VkBuffer> bufs) {
+        std::vector<VkBufferMemoryBarrier> barriers;
+        barriers.reserve(bufs.size());
+        for (auto b : bufs) {
+            VkBufferMemoryBarrier mb{};
+            mb.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+            mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+            mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+            mb.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            mb.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            mb.buffer = b;
+            mb.offset = 0;
+            mb.size = VK_WHOLE_SIZE;
+            barriers.push_back(mb);
+        }
+        vkCmdPipelineBarrier(cmd,
+                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                             0,
+                             0, nullptr,
+                             static_cast<uint32_t>(barriers.size()), barriers.data(),
+                             0, nullptr);
+    };
+
     // External forces (positions_in -> positions_out)
     bind_and_dispatch(external_forces_, group_count, push);
+    barrier_buffers({positions_b_});
 
     // Hash keys (also writes indices = i)
     bind_and_dispatch(hash_, group_count, push);
+    barrier_buffers({keys_, indices_});
 
     // Bitonic sort across padded length
     Push sort_push = push;
@@ -441,6 +467,7 @@ void FluidComputeContext::step(VkCommandBuffer cmd,
             bind_and_dispatch(bitonic_sort_, sort_group_count, sort_push);
         }
     }
+    barrier_buffers({keys_, indices_});
 
     // Mark range starts/ends using sorted keys
     bind_and_dispatch(range_mark_, group_count, push);
@@ -456,9 +483,11 @@ void FluidComputeContext::step(VkCommandBuffer cmd,
         scan_push.aux0 = offset;
         bind_and_dispatch(range_scan_bwd_, group_count, scan_push);
     }
+    barrier_buffers({range_starts_, range_ends_});
 
     // Reorder positions into binding 4 (positions_a_)
     bind_and_dispatch(reorder_, group_count, push);
+    barrier_buffers({positions_a_});
 
     // Copy sorted positions back to positions_out buffer (binding 1) for downstream kernels
     VkBufferCopy copy{};
