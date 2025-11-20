@@ -12,7 +12,7 @@ layout(std430, binding = 3) buffer ParticleIndices {
     uint indices[];
 };
 
-// Simple 3D integer hash (same as Seb Lague sample).
+// Simple 3D integer hash (same as Seb Lague Fluid-Sim sample: https://github.com/SebLague/Fluid-Sim)
 uint hash(uvec3 v) {
     // Simple mix to a scalar.
     v = (v + 0x7ed55d16u) + (v << 12u);

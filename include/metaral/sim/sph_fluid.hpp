@@ -1,4 +1,5 @@
-// Inspired by Seb Lague's GPU Fluid-Sim pipeline.
+// Inspired by Seb Lague's GPU Fluid-Sim pipeline
+// https://github.com/SebLague/Fluid-Sim
 // This is an initial scaffold for a SPH-like particle fluid running on CPU/GPU.
 // The current implementation is CPU-only and keeps interfaces narrow so a
 // Vulkan compute backend can be swapped in later without touching callers.
