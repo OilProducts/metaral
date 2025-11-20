@@ -1,0 +1,16 @@
+#version 450
+#include "fluid_common.glsl"
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 6) buffer RangeEnds { uint ends[]; };
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    uint count = params.numParticles;
+    if (i >= count) return;
+    uint off = params.aux0;
+    if (i + off < count && ends[i] == 0u) {
+        ends[i] = ends[i + off];
+    }
+}

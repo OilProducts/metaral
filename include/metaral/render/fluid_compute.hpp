@@ -77,6 +77,10 @@ private:
     VkPipeline pressure_ = VK_NULL_HANDLE;
     VkPipeline viscosity_ = VK_NULL_HANDLE;
     VkPipeline integrate_ = VK_NULL_HANDLE;
+    VkPipeline bitonic_sort_ = VK_NULL_HANDLE;
+    VkPipeline range_mark_ = VK_NULL_HANDLE;
+    VkPipeline range_scan_fwd_ = VK_NULL_HANDLE;
+    VkPipeline range_scan_bwd_ = VK_NULL_HANDLE;
 
     VkBuffer positions_a_ = VK_NULL_HANDLE;
     VkBuffer positions_b_ = VK_NULL_HANDLE;
@@ -96,6 +100,8 @@ private:
 
     uint32_t max_particles_ = 0;
     float last_smoothing_radius_ = 0.2f;
+    uint32_t last_count_ = 0;
+    uint32_t last_padded_ = 0;
 
     void destroy();
     VkPipeline create_compute_pipeline(const char* spv_path);

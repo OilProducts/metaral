@@ -29,11 +29,15 @@ if(METARAL_ENABLE_VULKAN)
         ${METARAL_SHADER_DIR}/fluid_common.glsl
         ${METARAL_SHADER_DIR}/fluid_external_forces.comp
         ${METARAL_SHADER_DIR}/fluid_spatial_hash.comp
+        ${METARAL_SHADER_DIR}/fluid_bitonic_sort.comp
         ${METARAL_SHADER_DIR}/fluid_reorder.comp
         ${METARAL_SHADER_DIR}/fluid_density.comp
         ${METARAL_SHADER_DIR}/fluid_pressure.comp
         ${METARAL_SHADER_DIR}/fluid_viscosity.comp
         ${METARAL_SHADER_DIR}/fluid_integrate.comp
+        ${METARAL_SHADER_DIR}/fluid_range_mark.comp
+        ${METARAL_SHADER_DIR}/fluid_range_scan_forward.comp
+        ${METARAL_SHADER_DIR}/fluid_range_scan_backward.comp
     )
 
     set(METARAL_VERT_SPV "${CMAKE_BINARY_DIR}/shaders/fullscreen_triangle.vert.spv")

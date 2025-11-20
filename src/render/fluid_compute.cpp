@@ -86,6 +86,10 @@ void FluidComputeContext::destroy() {
     destroy_pipeline(pressure_);
     destroy_pipeline(viscosity_);
     destroy_pipeline(integrate_);
+    destroy_pipeline(bitonic_sort_);
+    destroy_pipeline(range_mark_);
+    destroy_pipeline(range_scan_fwd_);
+    destroy_pipeline(range_scan_bwd_);
 
     if (pipeline_layout_) vkDestroyPipelineLayout(device_, pipeline_layout_, nullptr);
     if (set_layout_) vkDestroyDescriptorSetLayout(device_, set_layout_, nullptr);
@@ -279,7 +283,7 @@ void FluidComputeContext::initialize(VkDevice device,
     writes.push_back(write(1, positions_b_, positions_size));
     writes.push_back(write(2, keys_, scalar_u_size));
     writes.push_back(write(3, indices_, scalar_u_size));
-    writes.push_back(write(4, positions_b_, positions_size)); // sorted buffer placeholder
+    writes.push_back(write(4, positions_a_, positions_size)); // sorted output buffer
     writes.push_back(write(5, range_starts_, scalar_u_size));
     writes.push_back(write(6, range_ends_, scalar_u_size));
     writes.push_back(write(7, densities_, density_size));
@@ -294,6 +298,10 @@ void FluidComputeContext::initialize(VkDevice device,
     pressure_        = create_compute_pipeline(METARAL_SHADER_DIR "/fluid_pressure.spv");
     viscosity_       = create_compute_pipeline(METARAL_SHADER_DIR "/fluid_viscosity.spv");
     integrate_       = create_compute_pipeline(METARAL_SHADER_DIR "/fluid_integrate.spv");
+    bitonic_sort_    = create_compute_pipeline(METARAL_SHADER_DIR "/fluid_bitonic_sort.spv");
+    range_mark_      = create_compute_pipeline(METARAL_SHADER_DIR "/fluid_range_mark.spv");
+    range_scan_fwd_  = create_compute_pipeline(METARAL_SHADER_DIR "/fluid_range_scan_forward.spv");
+    range_scan_bwd_  = create_compute_pipeline(METARAL_SHADER_DIR "/fluid_range_scan_backward.spv");
 
     initialized_ = true;
 }
@@ -323,28 +331,11 @@ void FluidComputeContext::upload_particles(std::span<const sim::FluidParticle> p
         return;
     }
 
-    struct Slot {
-        uint32_t key;
-        sim::FluidParticle particle;
-    };
-
-    std::vector<Slot> slots;
-    slots.reserve(count);
-
-    // Build keys on CPU to avoid GPU hash/sort for now.
-    const float cell = std::max(1e-3f, last_smoothing_radius_);
-    for (uint32_t i = 0; i < count; ++i) {
-        const auto& p = particles[i];
-        int32_t cx = static_cast<int32_t>(std::floor(p.position.x / cell));
-        int32_t cy = static_cast<int32_t>(std::floor(p.position.y / cell));
-        int32_t cz = static_cast<int32_t>(std::floor(p.position.z / cell));
-        uint32_t key = cpu_hash(cx, cy, cz);
-        slots.push_back(Slot{key, p});
+    last_count_ = count;
+    last_padded_ = 1u << static_cast<uint32_t>(std::ceil(std::log2(std::max(1u, count))));
+    if (last_padded_ > max_particles_) {
+        last_padded_ = max_particles_;
     }
-
-    std::sort(slots.begin(), slots.end(), [](const Slot& a, const Slot& b) {
-        return a.key < b.key;
-    });
 
     const VkDeviceSize particle_bytes = sizeof(float) * 8;
     const VkDeviceSize copy_size = particle_bytes * count;
@@ -354,7 +345,7 @@ void FluidComputeContext::upload_particles(std::span<const sim::FluidParticle> p
         vkMapMemory(device_, mem, 0, copy_size, 0, &data);
         auto* out = static_cast<float*>(data);
         for (uint32_t i = 0; i < count; ++i) {
-            const auto& p = slots[i].particle;
+            const auto& p = particles[i];
             out[i * 8 + 0] = p.position.x;
             out[i * 8 + 1] = p.position.y;
             out[i * 8 + 2] = p.position.z;
@@ -370,56 +361,20 @@ void FluidComputeContext::upload_particles(std::span<const sim::FluidParticle> p
     write_positions(positions_mem_);
     write_positions(positions_b_mem_);
 
-    // Keys buffer (sorted)
-    {
+    auto fill_u32 = [&](VkDeviceMemory mem, uint32_t value) {
         void* data = nullptr;
-        vkMapMemory(device_, keys_mem_, 0, sizeof(uint32_t) * count, 0, &data);
+        vkMapMemory(device_, mem, 0, sizeof(uint32_t) * last_padded_, 0, &data);
         auto* out = static_cast<uint32_t*>(data);
-        for (uint32_t i = 0; i < count; ++i) {
-            out[i] = slots[i].key;
+        for (uint32_t i = 0; i < last_padded_; ++i) {
+            out[i] = (i < count) ? (value == UINT32_MAX ? 0u : i) : value;
         }
-        vkUnmapMemory(device_, keys_mem_);
-    }
+        vkUnmapMemory(device_, mem);
+    };
 
-    // Range starts/ends for each particle within same cell
-    {
-        void* start_ptr = nullptr;
-        void* end_ptr = nullptr;
-        vkMapMemory(device_, range_starts_mem_, 0, sizeof(uint32_t) * count, 0, &start_ptr);
-        vkMapMemory(device_, range_ends_mem_,   0, sizeof(uint32_t) * count, 0, &end_ptr);
-        auto* starts = static_cast<uint32_t*>(start_ptr);
-        auto* ends   = static_cast<uint32_t*>(end_ptr);
-
-        uint32_t run_begin = 0;
-        while (run_begin < count) {
-            uint32_t run_end = run_begin + 1;
-            const uint32_t key = slots[run_begin].key;
-            while (run_end < count && slots[run_end].key == key) {
-                ++run_end;
-            }
-            for (uint32_t i = run_begin; i < run_end; ++i) {
-                starts[i] = run_begin;
-                ends[i]   = run_end;
-            }
-            run_begin = run_end;
-        }
-        vkUnmapMemory(device_, range_starts_mem_);
-        vkUnmapMemory(device_, range_ends_mem_);
-    }
-
-    // Indices buffer (identity for now).
-    {
-        void* data = nullptr;
-        vkMapMemory(device_, indices_mem_, 0, sizeof(uint32_t) * count, 0, &data);
-        auto* out = static_cast<uint32_t*>(data);
-        for (uint32_t i = 0; i < count; ++i) {
-            out[i] = i;
-        }
-        vkUnmapMemory(device_, indices_mem_);
-    }
-
-    // TODO: Replace CPU sort/range build with GPU hash + radix sort + prefix
-    // offsets; then run the full compute pipeline entirely on GPU.
+    fill_u32(keys_mem_, 0xFFFFFFFFu); // hash kernel will overwrite first count entries
+    fill_u32(indices_mem_, 0u);
+    fill_u32(range_starts_mem_, 0u);
+    fill_u32(range_ends_mem_, 0u);
 }
 
 void FluidComputeContext::step(VkCommandBuffer cmd,
@@ -431,6 +386,8 @@ void FluidComputeContext::step(VkCommandBuffer cmd,
     }
 
     const uint32_t group_count = (count + 255u) / 256u;
+    const uint32_t padded = (last_padded_ > 0) ? last_padded_ : count;
+    const uint32_t sort_group_count = (padded + 255u) / 256u;
 
     struct Push {
         float deltaTime;
@@ -441,6 +398,9 @@ void FluidComputeContext::step(VkCommandBuffer cmd,
         float viscosityStrength;
         float gravity;
         uint32_t numParticles;
+        uint32_t aux0;
+        uint32_t aux1;
+        uint32_t aux2;
     } push;
 
     push.deltaTime = dt;
@@ -451,23 +411,81 @@ void FluidComputeContext::step(VkCommandBuffer cmd,
     push.viscosityStrength = params.viscosity_strength;
     push.gravity = params.gravity;
     push.numParticles = count;
+    push.aux0 = 0;
+    push.aux1 = 0;
+    push.aux2 = 0;
     last_smoothing_radius_ = params.smoothing_radius;
 
-    auto bind_and_dispatch = [&](VkPipeline pipeline) {
+    auto bind_and_dispatch = [&](VkPipeline pipeline, uint32_t groups, const Push& p) {
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
                                 pipeline_layout_, 0, 1, &descriptor_set_, 0, nullptr);
         vkCmdPushConstants(cmd, pipeline_layout_, VK_SHADER_STAGE_COMPUTE_BIT,
-                           0, sizeof(Push), &push);
-        vkCmdDispatch(cmd, group_count, 1, 1);
+                           0, sizeof(Push), &p);
+        vkCmdDispatch(cmd, groups, 1, 1);
     };
 
-    // Minimal sequence until hash/ranges are wired: just gravity + integrate.
-    bind_and_dispatch(external_forces_);
-    bind_and_dispatch(density_);
-    bind_and_dispatch(pressure_);
-    bind_and_dispatch(viscosity_);
-    bind_and_dispatch(integrate_);
+    // External forces (positions_in -> positions_out)
+    bind_and_dispatch(external_forces_, group_count, push);
+
+    // Hash keys (also writes indices = i)
+    bind_and_dispatch(hash_, group_count, push);
+
+    // Bitonic sort across padded length
+    Push sort_push = push;
+    sort_push.numParticles = padded;
+    for (uint32_t stage = 2; stage <= padded; stage <<= 1) {
+        for (uint32_t pass = stage >> 1; pass > 0; pass >>= 1) {
+            sort_push.aux0 = pass;
+            sort_push.aux1 = stage;
+            bind_and_dispatch(bitonic_sort_, sort_group_count, sort_push);
+        }
+    }
+
+    // Mark range starts/ends using sorted keys
+    bind_and_dispatch(range_mark_, group_count, push);
+
+    // Forward scan to propagate starts
+    Push scan_push = push;
+    for (uint32_t offset = 1; offset < count; offset <<= 1) {
+        scan_push.aux0 = offset;
+        bind_and_dispatch(range_scan_fwd_, group_count, scan_push);
+    }
+    // Backward scan to propagate ends
+    for (uint32_t offset = 1; offset < count; offset <<= 1) {
+        scan_push.aux0 = offset;
+        bind_and_dispatch(range_scan_bwd_, group_count, scan_push);
+    }
+
+    // Reorder positions into binding 4 (positions_a_)
+    bind_and_dispatch(reorder_, group_count, push);
+
+    // Copy sorted positions back to positions_out buffer (binding 1) for downstream kernels
+    VkBufferCopy copy{};
+    copy.srcOffset = 0;
+    copy.dstOffset = 0;
+    copy.size = sizeof(float) * 8 * count;
+    vkCmdCopyBuffer(cmd, positions_a_, positions_b_, 1, &copy);
+
+    VkBufferMemoryBarrier barrier{};
+    barrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+    barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.buffer = positions_b_;
+    barrier.offset = 0;
+    barrier.size = copy.size;
+    vkCmdPipelineBarrier(cmd,
+                         VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         0, 0, nullptr, 1, &barrier, 0, nullptr);
+
+    // Density / pressure / viscosity / integrate on sorted buffer
+    bind_and_dispatch(density_, group_count, push);
+    bind_and_dispatch(pressure_, group_count, push);
+    bind_and_dispatch(viscosity_, group_count, push);
+    bind_and_dispatch(integrate_, group_count, push);
 }
 
 } // namespace metaral::render

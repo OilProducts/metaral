@@ -1,0 +1,37 @@
+#version 450
+#include "fluid_common.glsl"
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 2) buffer HashKeys {
+    uint keys[];
+};
+
+layout(std430, binding = 3) buffer ParticleIndices {
+    uint indices[];
+};
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= params.numParticles) {
+        return;
+    }
+    uint partner = i ^ params.aux0; // pass
+    if (partner >= params.numParticles) {
+        return;
+    }
+    bool ascending = ( (i & params.aux1) == 0 ); // stage
+
+    uint key_i = keys[i];
+    uint key_p = keys[partner];
+    uint idx_i = indices[i];
+    uint idx_p = indices[partner];
+
+    bool swap = (key_i > key_p) == ascending;
+    if (swap) {
+        keys[i] = key_p;
+        keys[partner] = key_i;
+        indices[i] = idx_p;
+        indices[partner] = idx_i;
+    }
+}
