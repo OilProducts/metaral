@@ -38,6 +38,35 @@ uint32_t find_memory_type(VkPhysicalDevice physical,
     throw std::runtime_error("Failed to find suitable memory type for fluid buffers");
 }
 
+inline uint32_t cpu_hash(int32_t x, int32_t y, int32_t z) {
+    // Match the shader hash path; simple integer mix then fold to scalar.
+    uint32_t vx = static_cast<uint32_t>(x);
+    uint32_t vy = static_cast<uint32_t>(y);
+    uint32_t vz = static_cast<uint32_t>(z);
+    vx = (vx + 0x7ed55d16u) + (vx << 12u);
+    vx = (vx ^ 0xc761c23cu) ^ (vx >> 19u);
+    vx = (vx + 0x165667b1u) + (vx << 5u);
+    vx = (vx + 0xd3a2646cu) ^ (vx << 9u);
+    vx = (vx + 0xfd7046c5u) + (vx << 3u);
+    vx = (vx ^ 0xb55a4f09u) ^ (vx >> 16u);
+
+    vy = (vy + 0x7ed55d16u) + (vy << 12u);
+    vy = (vy ^ 0xc761c23cu) ^ (vy >> 19u);
+    vy = (vy + 0x165667b1u) + (vy << 5u);
+    vy = (vy + 0xd3a2646cu) ^ (vy << 9u);
+    vy = (vy + 0xfd7046c5u) + (vy << 3u);
+    vy = (vy ^ 0xb55a4f09u) ^ (vy >> 16u);
+
+    vz = (vz + 0x7ed55d16u) + (vz << 12u);
+    vz = (vz ^ 0xc761c23cu) ^ (vz >> 19u);
+    vz = (vz + 0x165667b1u) + (vz << 5u);
+    vz = (vz + 0xd3a2646cu) ^ (vz << 9u);
+    vz = (vz + 0xfd7046c5u) + (vz << 3u);
+    vz = (vz ^ 0xb55a4f09u) ^ (vz >> 16u);
+
+    return vx ^ vy ^ vz;
+}
+
 } // namespace
 
 FluidComputeContext::~FluidComputeContext() {
@@ -289,34 +318,108 @@ void FluidComputeContext::bootstrap_identity_ranges(uint32_t count) {
 void FluidComputeContext::upload_particles(std::span<const sim::FluidParticle> particles) {
     if (!initialized_) return;
     const uint32_t count = std::min<uint32_t>(max_particles_,
-                                             static_cast<uint32_t>(particles.size()));
+                                              static_cast<uint32_t>(particles.size()));
     if (count == 0) {
         return;
     }
 
+    struct Slot {
+        uint32_t key;
+        sim::FluidParticle particle;
+    };
+
+    std::vector<Slot> slots;
+    slots.reserve(count);
+
+    // Build keys on CPU to avoid GPU hash/sort for now.
+    const float cell = std::max(1e-3f, last_smoothing_radius_);
+    for (uint32_t i = 0; i < count; ++i) {
+        const auto& p = particles[i];
+        int32_t cx = static_cast<int32_t>(std::floor(p.position.x / cell));
+        int32_t cy = static_cast<int32_t>(std::floor(p.position.y / cell));
+        int32_t cz = static_cast<int32_t>(std::floor(p.position.z / cell));
+        uint32_t key = cpu_hash(cx, cy, cz);
+        slots.push_back(Slot{key, p});
+    }
+
+    std::sort(slots.begin(), slots.end(), [](const Slot& a, const Slot& b) {
+        return a.key < b.key;
+    });
+
     const VkDeviceSize particle_bytes = sizeof(float) * 8;
     const VkDeviceSize copy_size = particle_bytes * count;
 
-    void* data = nullptr;
-    vkMapMemory(device_, positions_mem_, 0, copy_size, 0, &data);
-    auto* out = static_cast<float*>(data);
-    for (uint32_t i = 0; i < count; ++i) {
-        const auto& p = particles[i];
-        // vec4 pos, vec4 vel
-        out[i * 8 + 0] = p.position.x;
-        out[i * 8 + 1] = p.position.y;
-        out[i * 8 + 2] = p.position.z;
-        out[i * 8 + 3] = 0.0f;
-        out[i * 8 + 4] = p.velocity.x;
-        out[i * 8 + 5] = p.velocity.y;
-        out[i * 8 + 6] = p.velocity.z;
-        out[i * 8 + 7] = 0.0f;
-    }
-    vkUnmapMemory(device_, positions_mem_);
+    auto write_positions = [&](VkDeviceMemory mem) {
+        void* data = nullptr;
+        vkMapMemory(device_, mem, 0, copy_size, 0, &data);
+        auto* out = static_cast<float*>(data);
+        for (uint32_t i = 0; i < count; ++i) {
+            const auto& p = slots[i].particle;
+            out[i * 8 + 0] = p.position.x;
+            out[i * 8 + 1] = p.position.y;
+            out[i * 8 + 2] = p.position.z;
+            out[i * 8 + 3] = 0.0f;
+            out[i * 8 + 4] = p.velocity.x;
+            out[i * 8 + 5] = p.velocity.y;
+            out[i * 8 + 6] = p.velocity.z;
+            out[i * 8 + 7] = 0.0f;
+        }
+        vkUnmapMemory(device_, mem);
+    };
 
-    // Naive neighbor ranges for now.
-    // TODO: replace with GPU radix sort + prefix offsets over spatial hash.
-    bootstrap_identity_ranges(count);
+    write_positions(positions_mem_);
+    write_positions(positions_b_mem_);
+
+    // Keys buffer (sorted)
+    {
+        void* data = nullptr;
+        vkMapMemory(device_, keys_mem_, 0, sizeof(uint32_t) * count, 0, &data);
+        auto* out = static_cast<uint32_t*>(data);
+        for (uint32_t i = 0; i < count; ++i) {
+            out[i] = slots[i].key;
+        }
+        vkUnmapMemory(device_, keys_mem_);
+    }
+
+    // Range starts/ends for each particle within same cell
+    {
+        void* start_ptr = nullptr;
+        void* end_ptr = nullptr;
+        vkMapMemory(device_, range_starts_mem_, 0, sizeof(uint32_t) * count, 0, &start_ptr);
+        vkMapMemory(device_, range_ends_mem_,   0, sizeof(uint32_t) * count, 0, &end_ptr);
+        auto* starts = static_cast<uint32_t*>(start_ptr);
+        auto* ends   = static_cast<uint32_t*>(end_ptr);
+
+        uint32_t run_begin = 0;
+        while (run_begin < count) {
+            uint32_t run_end = run_begin + 1;
+            const uint32_t key = slots[run_begin].key;
+            while (run_end < count && slots[run_end].key == key) {
+                ++run_end;
+            }
+            for (uint32_t i = run_begin; i < run_end; ++i) {
+                starts[i] = run_begin;
+                ends[i]   = run_end;
+            }
+            run_begin = run_end;
+        }
+        vkUnmapMemory(device_, range_starts_mem_);
+        vkUnmapMemory(device_, range_ends_mem_);
+    }
+
+    // Indices buffer (identity for now).
+    {
+        void* data = nullptr;
+        vkMapMemory(device_, indices_mem_, 0, sizeof(uint32_t) * count, 0, &data);
+        auto* out = static_cast<uint32_t*>(data);
+        for (uint32_t i = 0; i < count; ++i) {
+            out[i] = i;
+        }
+        vkUnmapMemory(device_, indices_mem_);
+    }
+
+    // TODO: Replace CPU sort/range build with GPU hash + radix sort + prefix
+    // offsets; then run the full compute pipeline entirely on GPU.
 }
 
 void FluidComputeContext::step(VkCommandBuffer cmd,
@@ -348,6 +451,7 @@ void FluidComputeContext::step(VkCommandBuffer cmd,
     push.viscosityStrength = params.viscosity_strength;
     push.gravity = params.gravity;
     push.numParticles = count;
+    last_smoothing_radius_ = params.smoothing_radius;
 
     auto bind_and_dispatch = [&](VkPipeline pipeline) {
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
@@ -360,6 +464,9 @@ void FluidComputeContext::step(VkCommandBuffer cmd,
 
     // Minimal sequence until hash/ranges are wired: just gravity + integrate.
     bind_and_dispatch(external_forces_);
+    bind_and_dispatch(density_);
+    bind_and_dispatch(pressure_);
+    bind_and_dispatch(viscosity_);
     bind_and_dispatch(integrate_);
 }
 

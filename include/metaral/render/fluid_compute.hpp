@@ -95,6 +95,7 @@ private:
     VkDeviceMemory densities_mem_ = VK_NULL_HANDLE;
 
     uint32_t max_particles_ = 0;
+    float last_smoothing_radius_ = 0.2f;
 
     void destroy();
     VkPipeline create_compute_pipeline(const char* spv_path);
