@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "metaral/render/sdf_grid.hpp"
+#include "metaral/render/fluid_compute.hpp"
 
 namespace metaral::render {
 
@@ -70,6 +71,11 @@ struct VulkanRenderer::Impl {
     core::PlanetPosition dirty_min{};
     core::PlanetPosition dirty_max{};
     std::function<void(VkCommandBuffer)> overlay_callback;
+
+    // Fluid compute
+    FluidComputeContext fluid;
+    sim::SphParams fluid_params{};
+    uint32_t fluid_particle_count = 0;
 };
 
 namespace {
@@ -887,6 +893,13 @@ VulkanRenderer::VulkanRenderer(const platform::VulkanContext& ctx,
     impl_->physical_device = pick_physical_device(*impl_);
     create_logical_device_and_queue(*impl_);
 
+    // Initialize fluid compute (safe even if unused yet).
+    FluidGpuParams fluid_gpu_params{};
+    impl_->fluid.initialize(impl_->device,
+                            impl_->physical_device,
+                            impl_->graphics_queue_family,
+                            fluid_gpu_params);
+
     // Swapchain and associated resources
     create_swapchain(*impl_);
     create_image_views(*impl_);
@@ -933,6 +946,9 @@ VulkanRenderer::~VulkanRenderer() {
     if (impl_->descriptor_pool != VK_NULL_HANDLE) {
         vkDestroyDescriptorPool(impl_->device, impl_->descriptor_pool, nullptr);
     }
+
+    // Fluid resources
+    impl_->fluid = FluidComputeContext{};
     if (impl_->descriptor_set_layout != VK_NULL_HANDLE) {
         vkDestroyDescriptorSetLayout(impl_->device, impl_->descriptor_set_layout, nullptr);
     }
@@ -1017,6 +1033,8 @@ void VulkanRenderer::draw_frame(const Camera& camera, const world::World& world)
     if (impl_->device == VK_NULL_HANDLE || impl_->swapchain == VK_NULL_HANDLE) {
         return;
     }
+
+    const bool fluid_ready = impl_->fluid.initialized();
 
     vkWaitForFences(impl_->device, 1, &impl_->in_flight, VK_TRUE, UINT64_MAX);
     vkResetFences(impl_->device, 1, &impl_->in_flight);
@@ -1105,6 +1123,14 @@ void VulkanRenderer::draw_frame(const Camera& camera, const world::World& world)
     VkCommandBufferBeginInfo begin_info{};
     begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
     vk_check(vkBeginCommandBuffer(cmd, &begin_info), "vkBeginCommandBuffer");
+
+    // Compute pass: run fluid step before the render pass.
+    if (fluid_ready && impl_->fluid_particle_count > 0) {
+        impl_->fluid.step(cmd,
+                          1.0f / 60.0f, // TODO: feed actual frame dt
+                          impl_->fluid_params,
+                          impl_->fluid_particle_count);
+    }
 
     VkClearValue clear_color{};
     clear_color.color = {{0.02f, 0.04f, 0.1f, 1.0f}};
@@ -1206,6 +1232,19 @@ void VulkanRenderer::set_overlay_callback(OverlayCallback callback) {
         return;
     }
     impl_->overlay_callback = std::move(callback);
+}
+
+sim::SphParams& VulkanRenderer::fluid_params() noexcept {
+    return impl_->fluid_params;
+}
+
+void VulkanRenderer::update_fluid_particles(std::span<const sim::FluidParticle> particles) noexcept {
+    if (!impl_ || !impl_->fluid.initialized()) {
+        return;
+    }
+    impl_->fluid.upload_particles(particles);
+    impl_->fluid_particle_count =
+        std::min<uint32_t>(static_cast<uint32_t>(particles.size()), 65536u);
 }
 
 void VulkanRenderer::wait_idle() {

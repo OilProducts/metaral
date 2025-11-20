@@ -1,0 +1,36 @@
+// Apply simple XSPH viscosity.
+#version 450
+#include "fluid_common.glsl"
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 5) buffer RangeStarts { uint starts[]; };
+layout(std430, binding = 6) buffer RangeEnds   { uint ends[]; };
+
+void main() {
+    if (params.viscosityStrength <= 0.0) {
+        return;
+    }
+
+    int i = particleIndex();
+    if (i < 0) return;
+
+    uint start = starts[i];
+    uint end   = ends[i];
+    vec3 pi = positions_out.particles[i].position.xyz;
+    vec3 vi = positions_out.particles[i].velocity.xyz;
+    float h = params.smoothingRadius;
+
+    for (uint j = start; j < end; ++j) {
+        if (j == uint(i)) continue;
+        vec3 pj = positions_out.particles[j].position.xyz;
+        vec3 vj = positions_out.particles[j].velocity.xyz;
+        float r = length(pi - pj);
+        if (r >= h) continue;
+        float q = r / h;
+        float w = (1.0 - q);
+        vi += params.viscosityStrength * w * (vj - vi) * params.deltaTime;
+    }
+
+    positions_out.particles[i].velocity = vec4(vi, 0.0);
+}

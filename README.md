@@ -258,6 +258,7 @@ Example classes:
 * `metaral::sim::MaterialSystem`
 * `metaral::sim::ThermalSystem`
 * `metaral::sim::WorldSimulator`
+* `metaral::sim::FluidSim` / `metaral::sim::DensityGrid` — SPH-inspired fluid scaffolding that will migrate to Vulkan compute; current CPU path keeps the API stable.
 
 > High-level idea: **`world/` owns the data layout**, **`sim/` owns how that data evolves over time**.
 

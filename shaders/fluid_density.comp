@@ -1,0 +1,51 @@
+// Compute density and near-density for each particle using naive neighbor walk
+// over a sorted range. Real range offsets will be provided by CPU-side table.
+#version 450
+#include "fluid_common.glsl"
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 5) buffer RangeStarts { uint starts[]; };
+layout(std430, binding = 6) buffer RangeEnds   { uint ends[]; };
+
+layout(std430, binding = 7) buffer DensityOut {
+    vec2 densities[]; // x = density, y = near-density
+};
+
+// Poly6 kernel constants (inlined for now).
+float w_poly6(float r, float h) {
+    if (r >= h) return 0.0;
+    float x = (h*h - r*r);
+    return 315.0 / (64.0 * 3.14159265 * pow(h, 9.0)) * x * x * x;
+}
+
+float w_spiky(float r, float h) {
+    if (r >= h) return 0.0;
+    float x = h - r;
+    return 15.0 / (3.14159265 * pow(h, 6.0)) * x * x * x;
+}
+
+void main() {
+    int i = particleIndex();
+    if (i < 0) return;
+
+    uint start = starts[i];
+    uint end   = ends[i];
+    vec3 pi = positions_out.particles[i].position.xyz;
+
+    float density = 0.0;
+    float near_density = 0.0;
+    float h = params.smoothingRadius;
+
+    for (uint j = start; j < end; ++j) {
+        vec3 pj = positions_out.particles[j].position.xyz;
+        float r = length(pi - pj);
+        float q = r / h;
+        if (q < 1.0) {
+            density += w_poly6(r, h);
+            near_density += w_spiky(r, h);
+        }
+    }
+
+    densities[i] = vec2(density, near_density);
+}

@@ -3,6 +3,7 @@
 #include "metaral/render/camera.hpp"
 #include "metaral/render/sdf_grid.hpp"
 #include "metaral/render/vulkan_renderer.hpp"
+#include "metaral/sim/fluid_system.hpp"
 #include "metaral/world/edit.hpp"
 #include "metaral/world/terrain.hpp"
 #include "metaral/world/world.hpp"
@@ -13,6 +14,7 @@
 #include <cstdint>
 #include <iostream>
 #include <memory>
+#include <span>
 #include <stdexcept>
 #include <string>
 
@@ -195,6 +197,9 @@ private:
     metaral::core::CoordinateConfig coords_{};
     std::unique_ptr<metaral::world::World> world_;
     std::unique_ptr<metaral::render::VulkanRenderer> renderer_;
+    std::unique_ptr<metaral::sim::FluidSystem> fluid_;
+    bool fluid_enabled_ = false;
+    bool fluid_spawned_ = false;
     metaral::render::Camera camera_{};
     int window_width_ = 0;
     int window_height_ = 0;
@@ -245,6 +250,11 @@ void VulkanViewer::on_init(const metaral::platform::AppInitContext& ctx) {
     renderer_ = std::make_unique<metaral::render::VulkanRenderer>(ctx.vulkan,
                                                                    static_cast<std::uint32_t>(window_width_),
                                                                    static_cast<std::uint32_t>(window_height_));
+
+    // Fluid system (disabled by default; toggled at runtime).
+    metaral::sim::SphParams sph_params{};
+    fluid_ = std::make_unique<metaral::sim::FluidSystem>(coords_, sph_params, /*water_material=*/2);
+    renderer_->fluid_params() = sph_params;
 
     metaral::render::OrbitParameters orbit{};
     orbit.altitude_m = 80.0f;          // high enough to see most of the planet
@@ -329,6 +339,28 @@ void VulkanViewer::on_frame(const metaral::platform::FrameContext& ctx) {
             brush_.material = static_cast<metaral::world::MaterialId>(brush_.material - 1);
         }
         std::cout << "Brush material decreased to " << brush_.material << "\n";
+    }
+
+    // Toggle fluid simulation on/off with 'F'
+    if (ctx.input.key_f_pressed && fluid_) {
+        fluid_enabled_ = !fluid_enabled_;
+        if (fluid_enabled_) {
+            // Spawn a small blob in front of the camera.
+            const PlanetPosition spawn_center = add(camera_.position, scale(normalized(camera_.forward), 10.0f));
+            const float spawn_radius = 3.0f;
+            const std::size_t spawn_count = 4000;
+            fluid_->clear_particles();
+            fluid_->spawn_sphere(spawn_center, spawn_radius, spawn_count);
+            renderer_->fluid_params() = fluid_->params();
+            renderer_->update_fluid_particles(fluid_->sim().particles());
+            fluid_spawned_ = true;
+            std::cout << "Fluid enabled; spawned " << spawn_count << " particles.\n";
+        } else {
+            fluid_->clear_particles();
+            renderer_->update_fluid_particles(std::span<const metaral::sim::FluidParticle>{});
+            fluid_spawned_ = false;
+            std::cout << "Fluid disabled.\n";
+        }
     }
 
     // Tool fire: left mouse button. This computes the hit, applies the brush
@@ -838,6 +870,27 @@ void VulkanViewer::render_imgui_overlay() {
     ImGui::Begin("##metaral_stats", nullptr, flags);
     const ImGuiIO& io = ImGui::GetIO();
     ImGui::Text("FPS: %.1f", io.Framerate);
+    if (fluid_) {
+        if (ImGui::Checkbox("Fluid (F)", &fluid_enabled_)) {
+            // Sync toggle state with renderer when user clicks the checkbox.
+            if (fluid_enabled_) {
+                const PlanetPosition spawn_center = {camera_.position.x, camera_.position.y + 2.0f, camera_.position.z};
+                fluid_->clear_particles();
+                fluid_->spawn_sphere(spawn_center, 3.0f, 4000);
+                renderer_->update_fluid_particles(fluid_->sim().particles());
+            } else {
+                fluid_->clear_particles();
+                renderer_->update_fluid_particles(std::span<const metaral::sim::FluidParticle>{});
+            }
+        }
+        auto& p = renderer_->fluid_params();
+        ImGui::SliderFloat("Smooth Radius", &p.smoothing_radius, 0.05f, 0.6f);
+        ImGui::SliderFloat("Target Density", &p.target_density, 200.0f, 1200.0f);
+        ImGui::SliderFloat("Pressure", &p.pressure_multiplier, 10.0f, 600.0f);
+        ImGui::SliderFloat("Near Pressure", &p.near_pressure_multiplier, 0.5f, 4.0f);
+        ImGui::SliderFloat("Viscosity", &p.viscosity_strength, 0.0f, 5.0f);
+        ImGui::SliderFloat("Gravity", &p.gravity, -50.0f, -1.0f);
+    }
     ImGui::End();
 }
 

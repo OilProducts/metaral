@@ -2,6 +2,7 @@
 
 #include "metaral/render/camera.hpp"
 #include "metaral/render/sdf_grid.hpp"
+#include "metaral/render/fluid_compute.hpp"
 #include "metaral/world/world.hpp"
 #include "metaral/platform/platform.hpp"
 
@@ -64,6 +65,12 @@ public:
     VulkanBackendHandles backend_handles() const;
 
     void set_overlay_callback(OverlayCallback callback);
+
+    // Expose fluid parameters for UI toggling.
+    sim::SphParams& fluid_params() noexcept;
+
+    // Upload particle data for the fluid compute path (clamped to GPU capacity).
+    void update_fluid_particles(std::span<const sim::FluidParticle> particles) noexcept;
 
     struct Impl;
 

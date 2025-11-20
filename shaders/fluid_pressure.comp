@@ -1,0 +1,42 @@
+// Compute pressure forces and update velocities in-place.
+#version 450
+#include "fluid_common.glsl"
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 5) buffer RangeStarts { uint starts[]; };
+layout(std430, binding = 6) buffer RangeEnds   { uint ends[]; };
+layout(std430, binding = 7) buffer DensityIn   { vec2 densities[]; };
+
+// vel_out writes back to positions_out velocities (pre-reordered buffer).
+void main() {
+    int i = particleIndex();
+    if (i < 0) return;
+
+    uint start = starts[i];
+    uint end   = ends[i];
+    vec3 pi = positions_out.particles[i].position.xyz;
+    vec3 vi = positions_out.particles[i].velocity.xyz;
+
+    float rho = densities[i].x;
+    float rhoN = densities[i].y;
+    float h = params.smoothingRadius;
+
+    float pressure = (rho - params.targetDensity) * params.pressureMultiplier;
+    float pressure_near = rhoN * params.nearPressureMultiplier;
+
+    for (uint j = start; j < end; ++j) {
+        if (j == uint(i)) continue;
+        vec3 pj = positions_out.particles[j].position.xyz;
+        vec3 dir = pj - pi;
+        float r = length(dir);
+        if (r >= h || r < 1e-6) continue;
+        float q = r / h;
+        float pressure_term = pressure * (1.0 - q) + pressure_near * (1.0 - q) * (1.0 - q);
+        vec3 n = dir / r;
+        vec3 impulse = pressure_term * n;
+        vi -= impulse * params.deltaTime;
+    }
+
+    positions_out.particles[i].velocity = vec4(vi, 0.0);
+}
