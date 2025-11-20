@@ -21,6 +21,9 @@ layout(push_constant) uniform FluidPush {
     float viscosityStrength;
     float gravity;
     uint  numParticles;
+    uint  aux0;
+    uint  aux1;
+    uint  aux2;
 } params;
 
 // Convenience: clamp thread id to particle count and return -1 if out.
