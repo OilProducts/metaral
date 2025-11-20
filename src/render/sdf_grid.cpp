@@ -9,6 +9,10 @@
 
 namespace metaral::render {
 
+constexpr std::uint8_t kSdfOctreeNodeEmpty      = 1u << 0;
+constexpr std::uint8_t kSdfOctreeNodeSolid      = 1u << 1;
+constexpr std::uint8_t kSdfOctreeNodeHasSurface = 1u << 2;
+
 namespace {
 
 constexpr float kSdfVoxelSizeMeters = .5f;
@@ -16,6 +20,11 @@ constexpr float kSdfMarginVoxels = 40.0f;
 // Width of the band (in cells) around the surface within which we smooth
 // the signed-distance field. Keeps far-field distances unchanged.
 constexpr float kSdfSmoothBandCells = 2.0f;
+
+// Octree configuration. These values are intentionally conservative and can be
+// tuned once the basic traversal is in place.
+constexpr std::uint32_t kSdfOctreeLeafBlockDim = 4; // voxels per leaf edge
+constexpr std::uint32_t kSdfOctreeMaxLevels    = 6; // not counting the dense grid
 
 // Chamfer mask costs for 3D 26-neighborhood: face, edge, corner.
 constexpr float kChamferFaceCost   = 1.0f;
@@ -55,6 +64,11 @@ inline float dot3(const core::PlanetPosition& a,
 inline float length_squared(const core::PlanetPosition& v) noexcept
 {
     return dot3(v, v);
+}
+
+inline std::uint32_t ceil_div(std::uint32_t a, std::uint32_t b) noexcept
+{
+    return (a + b - 1u) / b;
 }
 
 struct DistanceNode {
@@ -302,6 +316,310 @@ void smooth_sdf_full(SdfGrid& grid)
     grid.values.swap(dst);
 }
 
+// Build a conservative, multi-level octree over the existing SDF grid. The
+// current implementation focuses on producing usable metadata (min distance
+// bounds and empty/solid/mixed classification); traversal integration and
+// incremental updates are layered on separately.
+void build_sdf_octree_full(const SdfGrid& grid, SdfGrid& out_grid)
+{
+    const std::uint32_t dim = grid.dim;
+    if (dim == 0 || grid.voxel_size <= 0.0f || grid.half_extent <= 0.0f) {
+        out_grid.has_octree = false;
+        out_grid.octree.clear();
+        return;
+    }
+
+    const std::size_t cell_count =
+        static_cast<std::size_t>(dim) * dim * dim;
+    if (grid.values.size() != cell_count ||
+        grid.occupancy.size() != cell_count) {
+        out_grid.has_octree = false;
+        out_grid.octree.clear();
+        return;
+    }
+
+    // Compute per-level dimensions starting from a leaf grid whose cells each
+    // cover kSdfOctreeLeafBlockDim^3 dense SDF samples.
+    std::vector<std::uint32_t> level_dims;
+    level_dims.reserve(kSdfOctreeMaxLevels);
+
+    const std::uint32_t leaf_dim =
+        ceil_div(dim, kSdfOctreeLeafBlockDim);
+    if (leaf_dim == 0) {
+        out_grid.has_octree = false;
+        out_grid.octree.clear();
+        return;
+    }
+    level_dims.push_back(leaf_dim);
+
+    std::uint32_t current_dim = leaf_dim;
+    while (current_dim > 1u &&
+           level_dims.size() < kSdfOctreeMaxLevels) {
+        current_dim = ceil_div(current_dim, 2u);
+        level_dims.push_back(current_dim);
+    }
+
+    const std::uint32_t depth =
+        static_cast<std::uint32_t>(level_dims.size());
+
+    // Compute level offsets and total node count.
+    std::vector<std::uint32_t> level_offsets(depth, 0);
+    std::size_t total_nodes = 0;
+    for (std::uint32_t level = 0; level < depth; ++level) {
+        level_offsets[level] = static_cast<std::uint32_t>(total_nodes);
+        const std::uint64_t d = level_dims[level];
+        const std::uint64_t count = d * d * d;
+        total_nodes += static_cast<std::size_t>(count);
+    }
+
+    if (total_nodes == 0) {
+        out_grid.has_octree = false;
+        out_grid.octree.clear();
+        return;
+    }
+
+    std::vector<SdfOctreeNode> nodes(total_nodes);
+
+    const float voxel_size = grid.voxel_size;
+    const float grid_min = -grid.half_extent;
+
+    // Build the leaf level directly from the dense SDF/occupancy.
+    {
+        const std::uint32_t leaf_dim_local = level_dims[0];
+        const std::uint32_t leaf_level_offset = level_offsets[0];
+
+        for (std::uint32_t z = 0; z < leaf_dim_local; ++z) {
+            const std::uint32_t base_z = z * kSdfOctreeLeafBlockDim;
+            const std::uint32_t max_z =
+                std::min(base_z + kSdfOctreeLeafBlockDim, dim);
+
+            for (std::uint32_t y = 0; y < leaf_dim_local; ++y) {
+                const std::uint32_t base_y = y * kSdfOctreeLeafBlockDim;
+                const std::uint32_t max_y =
+                    std::min(base_y + kSdfOctreeLeafBlockDim, dim);
+
+                for (std::uint32_t x = 0; x < leaf_dim_local; ++x) {
+                    const std::uint32_t base_x = x * kSdfOctreeLeafBlockDim;
+                    const std::uint32_t max_x =
+                        std::min(base_x + kSdfOctreeLeafBlockDim, dim);
+
+                    const std::size_t node_index =
+                        leaf_level_offset +
+                        linear_index(leaf_dim_local, x, y, z);
+                    SdfOctreeNode& node = nodes[node_index];
+
+                    bool any_solid = false;
+                    bool any_empty = false;
+                    float min_abs_dist = std::numeric_limits<float>::infinity();
+                    float max_abs_dist = 0.0f;
+
+                    for (std::uint32_t zz = base_z; zz < max_z; ++zz) {
+                        for (std::uint32_t yy = base_y; yy < max_y; ++yy) {
+                            for (std::uint32_t xx = base_x; xx < max_x; ++xx) {
+                                const std::size_t cell_index =
+                                    linear_index(dim, xx, yy, zz);
+
+                                const std::uint8_t occ =
+                                    grid.occupancy[cell_index];
+                                if (occ != 0u) {
+                                    any_solid = true;
+                                } else {
+                                    any_empty = true;
+                                }
+
+                                const float v = grid.values[cell_index];
+                                if (std::isfinite(v)) {
+                                    const float a = std::fabs(v);
+                                    if (a < min_abs_dist) {
+                                        min_abs_dist = a;
+                                    }
+                                    if (a > max_abs_dist) {
+                                        max_abs_dist = a;
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // Compute world-space bounds for this node.
+                    const float x_min = grid_min +
+                        static_cast<float>(base_x) * voxel_size;
+                    const float x_max = grid_min +
+                        static_cast<float>(max_x) * voxel_size;
+                    const float y_min = grid_min +
+                        static_cast<float>(base_y) * voxel_size;
+                    const float y_max = grid_min +
+                        static_cast<float>(max_y) * voxel_size;
+                    const float z_min = grid_min +
+                        static_cast<float>(base_z) * voxel_size;
+                    const float z_max = grid_min +
+                        static_cast<float>(max_z) * voxel_size;
+
+                    node.center.x = 0.5f * (x_min + x_max);
+                    node.center.y = 0.5f * (y_min + y_max);
+                    node.center.z = 0.5f * (z_min + z_max);
+                    node.half_size = 0.5f * std::max(
+                        std::max(x_max - x_min, y_max - y_min),
+                        z_max - z_min);
+
+                    node.min_distance = min_abs_dist;
+                    node.max_distance = max_abs_dist;
+                    node.first_child = std::numeric_limits<std::uint32_t>::max();
+
+                    std::uint8_t occ_mask = 0;
+                    if (any_empty) occ_mask |= kSdfOctreeNodeEmpty;
+                    if (any_solid) occ_mask |= kSdfOctreeNodeSolid;
+                    node.occupancy_mask = occ_mask;
+
+                    std::uint8_t flags = 0;
+                    if (any_empty && any_solid) {
+                        flags |= kSdfOctreeNodeHasSurface;
+                    }
+                    node.flags = flags;
+                    node.reserved = 0;
+                }
+            }
+        }
+    }
+
+    // Build higher levels by aggregating child nodes in 2x2x2 groups.
+    for (std::uint32_t level = 1; level < depth; ++level) {
+        const std::uint32_t dim_here = level_dims[level];
+        const std::uint32_t dim_child = level_dims[level - 1];
+        const std::uint32_t offset_here = level_offsets[level];
+        const std::uint32_t offset_child = level_offsets[level - 1];
+
+        for (std::uint32_t z = 0; z < dim_here; ++z) {
+            for (std::uint32_t y = 0; y < dim_here; ++y) {
+                for (std::uint32_t x = 0; x < dim_here; ++x) {
+                    const std::size_t parent_index =
+                        offset_here + linear_index(dim_here, x, y, z);
+                    SdfOctreeNode& parent = nodes[parent_index];
+
+                    bool any_child = false;
+                    bool any_solid = false;
+                    bool any_empty = false;
+                    bool any_surface = false;
+                    float min_abs_dist = std::numeric_limits<float>::infinity();
+                    float max_abs_dist = 0.0f;
+
+                    core::PlanetPosition bounds_min{
+                        std::numeric_limits<float>::infinity(),
+                        std::numeric_limits<float>::infinity(),
+                        std::numeric_limits<float>::infinity()};
+                    core::PlanetPosition bounds_max{
+                        -std::numeric_limits<float>::infinity(),
+                        -std::numeric_limits<float>::infinity(),
+                        -std::numeric_limits<float>::infinity()};
+
+                    const std::uint32_t child_x0 = x * 2u;
+                    const std::uint32_t child_y0 = y * 2u;
+                    const std::uint32_t child_z0 = z * 2u;
+
+                    for (std::uint32_t dz = 0; dz < 2u; ++dz) {
+                        const std::uint32_t cz = child_z0 + dz;
+                        if (cz >= dim_child) continue;
+                        for (std::uint32_t dy = 0; dy < 2u; ++dy) {
+                            const std::uint32_t cy = child_y0 + dy;
+                            if (cy >= dim_child) continue;
+                            for (std::uint32_t dx = 0; dx < 2u; ++dx) {
+                                const std::uint32_t cx = child_x0 + dx;
+                                if (cx >= dim_child) continue;
+
+                                const std::size_t child_index =
+                                    offset_child +
+                                    linear_index(dim_child, cx, cy, cz);
+                                SdfOctreeNode& child = nodes[child_index];
+
+                                any_child = true;
+
+                                const float child_min = child.min_distance;
+                                const float child_max = child.max_distance;
+                                if (child_min < min_abs_dist) {
+                                    min_abs_dist = child_min;
+                                }
+                                if (child_max > max_abs_dist) {
+                                    max_abs_dist = child_max;
+                                }
+
+                                if (child.occupancy_mask & kSdfOctreeNodeEmpty) {
+                                    any_empty = true;
+                                }
+                                if (child.occupancy_mask & kSdfOctreeNodeSolid) {
+                                    any_solid = true;
+                                }
+                                if (child.flags & kSdfOctreeNodeHasSurface) {
+                                    any_surface = true;
+                                }
+
+                                const float hx = child.half_size;
+                                const core::PlanetPosition cmin{
+                                    child.center.x - hx,
+                                    child.center.y - hx,
+                                    child.center.z - hx};
+                                const core::PlanetPosition cmax{
+                                    child.center.x + hx,
+                                    child.center.y + hx,
+                                    child.center.z + hx};
+
+                                bounds_min.x = std::min(bounds_min.x, cmin.x);
+                                bounds_min.y = std::min(bounds_min.y, cmin.y);
+                                bounds_min.z = std::min(bounds_min.z, cmin.z);
+                                bounds_max.x = std::max(bounds_max.x, cmax.x);
+                                bounds_max.y = std::max(bounds_max.y, cmax.y);
+                                bounds_max.z = std::max(bounds_max.z, cmax.z);
+                            }
+                        }
+                    }
+
+                    if (!any_child) {
+                        parent.center = core::PlanetPosition{0.0f, 0.0f, 0.0f};
+                        parent.half_size = 0.0f;
+                        parent.min_distance = std::numeric_limits<float>::infinity();
+                        parent.max_distance = 0.0f;
+                        parent.first_child = std::numeric_limits<std::uint32_t>::max();
+                        parent.occupancy_mask = 0;
+                        parent.flags = 0;
+                        parent.reserved = 0;
+                        continue;
+                    }
+
+                    parent.center.x = 0.5f * (bounds_min.x + bounds_max.x);
+                    parent.center.y = 0.5f * (bounds_min.y + bounds_max.y);
+                    parent.center.z = 0.5f * (bounds_min.z + bounds_max.z);
+                    parent.half_size = 0.5f * std::max(
+                        std::max(bounds_max.x - bounds_min.x,
+                                 bounds_max.y - bounds_min.y),
+                        bounds_max.z - bounds_min.z);
+
+                    parent.min_distance = min_abs_dist;
+                    parent.max_distance = max_abs_dist;
+                    parent.first_child = offset_child +
+                        linear_index(dim_child, child_x0, child_y0, child_z0);
+
+                    std::uint8_t occ_mask = 0;
+                    if (any_empty) occ_mask |= kSdfOctreeNodeEmpty;
+                    if (any_solid) occ_mask |= kSdfOctreeNodeSolid;
+                    parent.occupancy_mask = occ_mask;
+
+                    std::uint8_t flags = 0;
+                    if (any_surface || (any_empty && any_solid)) {
+                        flags |= kSdfOctreeNodeHasSurface;
+                    }
+                    parent.flags = flags;
+                    parent.reserved = 0;
+                }
+            }
+        }
+    }
+
+    // Commit to the output grid.
+    out_grid.octree.nodes = std::move(nodes);
+    out_grid.octree.level_offsets = std::move(level_offsets);
+    out_grid.octree.depth = depth;
+    out_grid.has_octree = true;
+}
+
 } // namespace
 void build_sdf_grid_from_world(const world::World& world,
                                const core::CoordinateConfig& cfg,
@@ -385,6 +703,11 @@ void build_sdf_grid_from_world(const world::World& world,
     // Apply a small smoothing kernel near the surface to visually soften
     // voxel-scale artifacts in the raymarched geometry.
     smooth_sdf_full(out);
+
+    // Build a conservative octree over the finished grid to accelerate
+    // raymarching. If construction fails for any reason, the grid simply
+    // reports has_octree == false and traversal falls back to the dense SDF.
+    build_sdf_octree_full(out, out);
 }
 
 float sample_sdf(const SdfGrid& grid,
@@ -480,6 +803,152 @@ float sample_sdf(const SdfGrid& grid,
     return vy0 + (vy1 - vy0) * fz;
 }
 
+inline bool point_inside_octree_node(const SdfOctreeNode& node,
+                                     const core::PlanetPosition& p) noexcept
+{
+    const float h = node.half_size;
+    if (h <= 0.0f) {
+        return false;
+    }
+    const float dx = p.x - node.center.x;
+    const float dy = p.y - node.center.y;
+    const float dz = p.z - node.center.z;
+    return std::fabs(dx) <= h &&
+           std::fabs(dy) <= h &&
+           std::fabs(dz) <= h;
+}
+
+bool advance_ray_with_octree(const SdfGrid& grid,
+                             const core::PlanetPosition& ray_origin,
+                             const core::PlanetPosition& ray_dir,
+                             float max_dist,
+                             float& t)
+{
+    if (!grid.has_octree ||
+        grid.octree.depth == 0 ||
+        grid.octree.nodes.empty() ||
+        grid.octree.level_offsets.size() < grid.octree.depth) {
+        return false;
+    }
+
+    const float dir_len_sq = length_squared(ray_dir);
+    if (dir_len_sq <= 0.0f) {
+        return false;
+    }
+
+    const std::uint32_t root_index =
+        grid.octree.level_offsets[grid.octree.depth - 1u];
+    if (root_index >= grid.octree.nodes.size()) {
+        return false;
+    }
+
+    const auto& nodes = grid.octree.nodes;
+
+    core::PlanetPosition p{
+        ray_origin.x + ray_dir.x * t,
+        ray_origin.y + ray_dir.y * t,
+        ray_origin.z + ray_dir.z * t,
+    };
+
+    if (!point_inside_octree_node(nodes[root_index], p)) {
+        return false;
+    }
+
+    std::uint32_t current = root_index;
+
+    // Descend towards the deepest node that contains the current point.
+    for (;;) {
+        const SdfOctreeNode& node = nodes[current];
+
+        // If this node is not purely empty or has no children, stop.
+        const bool has_solid =
+            (node.occupancy_mask & kSdfOctreeNodeSolid) != 0;
+        const bool has_empty =
+            (node.occupancy_mask & kSdfOctreeNodeEmpty) != 0;
+        if (!has_empty || node.first_child == std::numeric_limits<std::uint32_t>::max()) {
+            break;
+        }
+
+        const std::uint32_t first_child = node.first_child;
+        const std::uint32_t max_child = first_child + 8u;
+        std::uint32_t next = std::numeric_limits<std::uint32_t>::max();
+
+        for (std::uint32_t child = first_child;
+             child < max_child && child < nodes.size();
+             ++child) {
+            if (point_inside_octree_node(nodes[child], p)) {
+                next = child;
+                break;
+            }
+        }
+
+        if (next == std::numeric_limits<std::uint32_t>::max()) {
+            break;
+        }
+        current = next;
+    }
+
+    const SdfOctreeNode& leaf = nodes[current];
+    const bool leaf_is_pure_empty =
+        (leaf.occupancy_mask == kSdfOctreeNodeEmpty);
+    if (!leaf_is_pure_empty) {
+        return false;
+    }
+
+    const float hx = leaf.half_size;
+    if (hx <= 0.0f) {
+        return false;
+    }
+
+    const float min_x = leaf.center.x - hx;
+    const float max_x = leaf.center.x + hx;
+    const float min_y = leaf.center.y - hx;
+    const float max_y = leaf.center.y + hx;
+    const float min_z = leaf.center.z - hx;
+    const float max_z = leaf.center.z + hx;
+
+    float tmin = -std::numeric_limits<float>::infinity();
+    float tmax =  std::numeric_limits<float>::infinity();
+
+    auto intersect_axis = [&](float ro, float rd, float mn, float mx) -> bool {
+        if (std::fabs(rd) < 1e-6f) {
+            return ro >= mn && ro <= mx;
+        }
+        const float inv = 1.0f / rd;
+        float t1 = (mn - ro) * inv;
+        float t2 = (mx - ro) * inv;
+        if (t1 > t2) {
+            const float tmp = t1;
+            t1 = t2;
+            t2 = tmp;
+        }
+        tmin = std::max(tmin, t1);
+        tmax = std::min(tmax, t2);
+        return tmax >= tmin;
+    };
+
+    if (!intersect_axis(ray_origin.x, ray_dir.x, min_x, max_x) ||
+        !intersect_axis(ray_origin.y, ray_dir.y, min_y, max_y) ||
+        !intersect_axis(ray_origin.z, ray_dir.z, min_z, max_z)) {
+        return false;
+    }
+
+    // We know the current point lies inside this box, so t is within
+    // [tmin, tmax]. We want to advance to the exit point.
+    const float exit_t = tmax;
+    if (exit_t <= t + 1e-4f) {
+        return false;
+    }
+
+    const float new_t = std::min(exit_t, max_dist);
+    if (new_t <= t) {
+        return false;
+    }
+
+    t = new_t;
+    return true;
+}
+
 float raymarch_sdf(const SdfGrid& grid,
                    const core::PlanetPosition& ray_origin,
                    const core::PlanetPosition& ray_dir,
@@ -536,6 +1005,19 @@ float raymarch_sdf(const SdfGrid& grid,
     core::PlanetPosition best_pos{};
 
     for (int i = 0; i < max_steps; ++i) {
+        if (grid.has_octree) {
+            if (advance_ray_with_octree(grid,
+                                        ray_origin,
+                                        ray_dir,
+                                        max_dist,
+                                        t)) {
+                if (t >= max_dist) {
+                    break;
+                }
+                continue;
+            }
+        }
+
         core::PlanetPosition p{
             ray_origin.x + ray_dir.x * t,
             ray_origin.y + ray_dir.y * t,
@@ -991,6 +1473,11 @@ void update_sdf_region_from_world(const world::World& world,
             }
         }
     }
+
+    // The octree currently mirrors the full dense grid, so when a region is
+    // updated we conservatively rebuild the hierarchy. This can be optimized
+    // later to only touch affected nodes.
+    build_sdf_octree_full(out, out);
 }
 
 } // namespace metaral::render

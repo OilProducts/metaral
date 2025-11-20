@@ -14,6 +14,10 @@ layout(push_constant) uniform CameraParams {
     float isoFraction;
     vec3 sunDirection; float sunIntensity;
     vec3 sunColor;     float pad2;
+    float octreeRootIndex;
+    float octreeMaxDepth;
+    float octreeNodeCount;
+    float octreeEnabled;
 } uCamera;
 
 layout(std430, set = 0, binding = 0) readonly buffer SdfGrid {
@@ -23,6 +27,27 @@ layout(std430, set = 0, binding = 0) readonly buffer SdfGrid {
 layout(std430, set = 0, binding = 1) readonly buffer SdfMaterials {
     uint values[];
 } uMaterials;
+
+struct SdfOctreeNode {
+    // center.xyz = node center in world space; center.w = half-size in meters.
+    vec4 centerAndHalf;
+    float minDistance;
+    float maxDistance;
+    uint firstChild;
+    uint occupancyMask;
+    uint flags;
+    uint pad0;
+    uint pad1;
+    uint pad2;
+};
+
+layout(std430, set = 0, binding = 2) readonly buffer SdfOctreeNodes {
+    SdfOctreeNode nodes[];
+} uOctree;
+
+const uint SDF_OCTREE_NODE_EMPTY      = 1u << 0;
+const uint SDF_OCTREE_NODE_SOLID      = 1u << 1;
+const uint SDF_OCTREE_NODE_HAS_SURFACE = 1u << 2;
 
 vec3 ray_direction(vec2 uv) {
     // uv in [0,1]; convert to NDC [-1,1]
@@ -65,6 +90,125 @@ bool ray_sphere_bounds(vec3 ro,
         tEnter = tExit;
         tExit = tmp;
     }
+    return true;
+}
+
+bool point_inside_node(SdfOctreeNode node, vec3 p) {
+    float h = node.centerAndHalf.w;
+    if (h <= 0.0) {
+        return false;
+    }
+    vec3 d = p - node.centerAndHalf.xyz;
+    return abs(d.x) <= h && abs(d.y) <= h && abs(d.z) <= h;
+}
+
+bool intersect_box_axis(float ro, float rd, float mn, float mx,
+                        inout float tmin, inout float tmax) {
+    if (abs(rd) < 1e-6) {
+        return ro >= mn && ro <= mx;
+    }
+    float inv = 1.0 / rd;
+    float t1 = (mn - ro) * inv;
+    float t2 = (mx - ro) * inv;
+    if (t1 > t2) {
+        float tmp = t1;
+        t1 = t2;
+        t2 = tmp;
+    }
+    tmin = max(tmin, t1);
+    tmax = min(tmax, t2);
+    return tmax >= tmin;
+}
+
+bool advance_with_octree(vec3 ro, vec3 rd, float maxDist, inout float t) {
+    if (uCamera.octreeEnabled <= 0.5 ||
+        uCamera.octreeNodeCount <= 0.0 ||
+        uCamera.octreeRootIndex < 0.0) {
+        return false;
+    }
+
+    uint nodeCount = uint(uCamera.octreeNodeCount);
+    uint rootIndex = uint(uCamera.octreeRootIndex);
+    if (nodeCount == 0u || rootIndex >= nodeCount) {
+        return false;
+    }
+
+    float dirLenSq = dot(rd, rd);
+    if (dirLenSq <= 0.0) {
+        return false;
+    }
+
+    vec3 p = ro + rd * t;
+    SdfOctreeNode root = uOctree.nodes[rootIndex];
+    if (!point_inside_node(root, p)) {
+        return false;
+    }
+
+    uint current = rootIndex;
+    for (;;) {
+        SdfOctreeNode node = uOctree.nodes[current];
+
+        bool hasEmpty = (node.occupancyMask & SDF_OCTREE_NODE_EMPTY) != 0u;
+        bool hasSolid = (node.occupancyMask & SDF_OCTREE_NODE_SOLID) != 0u;
+
+        if (!hasEmpty || node.firstChild == 0xffffffffu) {
+            break;
+        }
+
+        uint firstChild = node.firstChild;
+        uint maxChild = firstChild + 8u;
+        uint next = 0xffffffffu;
+
+        for (uint child = firstChild;
+             child < maxChild && child < nodeCount;
+             ++child) {
+            if (point_inside_node(uOctree.nodes[child], p)) {
+                next = child;
+                break;
+            }
+        }
+
+        if (next == 0xffffffffu) {
+            break;
+        }
+        current = next;
+    }
+
+    SdfOctreeNode leaf = uOctree.nodes[current];
+    bool pureEmpty = (leaf.occupancyMask == SDF_OCTREE_NODE_EMPTY);
+    if (!pureEmpty) {
+        return false;
+    }
+
+    float h = leaf.centerAndHalf.w;
+    if (h <= 0.0) {
+        return false;
+    }
+
+    vec3 c = leaf.centerAndHalf.xyz;
+    vec3 bmin = c - vec3(h);
+    vec3 bmax = c + vec3(h);
+
+    float tmin = -1e30;
+    float tmax =  1e30;
+
+    if (!intersect_box_axis(ro.x, rd.x, bmin.x, bmax.x, tmin, tmax) ||
+        !intersect_box_axis(ro.y, rd.y, bmin.y, bmax.y, tmin, tmax) ||
+        !intersect_box_axis(ro.z, rd.z, bmin.z, bmax.z, tmin, tmax)) {
+        return false;
+    }
+
+    float exitT = tmax;
+    if (exitT <= t + 1e-4) {
+        return false;
+    }
+
+    float newT = min(exitT, maxDist);
+    if (newT <= t) {
+        return false;
+    }
+
+    t = newT;
     return true;
 }
 
@@ -162,6 +306,7 @@ bool march_sdf(vec3 ro, vec3 rd, out vec3 hitPos, out vec3 normal) {
     float isoOffset = uCamera.isoFraction * uCamera.gridVoxelSize;
 
     float boundaryRadius = uCamera.gridHalfExtent;
+    float maxDist = (boundaryRadius > 0.0) ? boundaryRadius * 2.0 : 1e6;
 
     float t = 0.0;
     if (boundaryRadius > 0.0) {
@@ -186,6 +331,13 @@ bool march_sdf(vec3 ro, vec3 rd, out vec3 hitPos, out vec3 normal) {
     float bestT    = 0.0;
 
     for (int i = 0; i < MAX_STEPS; ++i) {
+        if (advance_with_octree(ro, rd, maxDist, t)) {
+            if (t >= maxDist) {
+                break;
+            }
+            continue;
+        }
+
         vec3 p = ro + rd * t;
         float d_raw = sample_sdf(p);
         float d = d_raw - isoOffset;

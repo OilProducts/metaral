@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <cstring>
 #include <functional>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -55,6 +56,11 @@ struct VulkanRenderer::Impl {
     VkDeviceMemory sdf_memory = VK_NULL_HANDLE;
     VkBuffer material_buffer = VK_NULL_HANDLE;
     VkDeviceMemory material_memory = VK_NULL_HANDLE;
+    VkBuffer sdf_octree_buffer = VK_NULL_HANDLE;
+    VkDeviceMemory sdf_octree_memory = VK_NULL_HANDLE;
+    uint32_t sdf_octree_node_count = 0;
+    uint32_t sdf_octree_root_index = 0;
+    uint32_t sdf_octree_depth = 0;
     uint32_t sdf_dim = 0;
     float sdf_voxel_size = 0.0f;
     float sdf_radius = 0.0f;
@@ -359,10 +365,29 @@ struct CameraPush {
     float isoFraction;    // fraction of gridVoxelSize used as SDF iso-offset
     float sunDirection[3]; float sunIntensity;
     float sunColor[3];     float pad2;
+    float octreeRootIndex;
+    float octreeMaxDepth;
+    float octreeNodeCount;
+    float octreeEnabled;
 };
 
+struct alignas(16) GpuSdfOctreeNode {
+    float center[3];
+    float half_size;
+    float min_distance;
+    float max_distance;
+    std::uint32_t first_child;
+    std::uint32_t occupancy_mask;
+    std::uint32_t flags;
+    std::uint32_t pad0;
+    std::uint32_t pad1;
+    std::uint32_t pad2;
+};
+
+static_assert(sizeof(GpuSdfOctreeNode) == 48, "GpuSdfOctreeNode size must match GLSL layout");
+
 void create_pipeline(Impl& impl) {
-    VkDescriptorSetLayoutBinding bindings[2]{};
+    VkDescriptorSetLayoutBinding bindings[3]{};
 
     // binding 0: SDF buffer
     bindings[0].binding = 0;
@@ -376,9 +401,15 @@ void create_pipeline(Impl& impl) {
     bindings[1].descriptorCount = 1;
     bindings[1].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
 
+    // binding 2: SDF octree nodes
+    bindings[2].binding = 2;
+    bindings[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    bindings[2].descriptorCount = 1;
+    bindings[2].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+
     VkDescriptorSetLayoutCreateInfo set_layout_info{};
     set_layout_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    set_layout_info.bindingCount = 2;
+    set_layout_info.bindingCount = 3;
     set_layout_info.pBindings = bindings;
 
     vk_check(vkCreateDescriptorSetLayout(impl.device,
@@ -516,6 +547,32 @@ void ensure_sdf_grid(Impl& impl,
         impl.sdf_grid.values.size() * sizeof(float);
     const std::size_t mat_count = impl.sdf_grid.materials.size();
 
+    // Cache octree metadata from the CPU grid. If the octree is unavailable or
+    // failed to build, we simply leave the node count at zero and the shader
+    // falls back to dense SDF marching.
+    std::size_t octree_node_count = 0;
+    if (impl.sdf_grid.has_octree) {
+        octree_node_count = impl.sdf_grid.octree.nodes.size();
+    }
+    if (octree_node_count > static_cast<std::size_t>(std::numeric_limits<std::uint32_t>::max())) {
+        // Extremely unlikely; clamp and effectively disable the octree.
+        octree_node_count = 0;
+    }
+    impl.sdf_octree_node_count = static_cast<std::uint32_t>(octree_node_count);
+    impl.sdf_octree_depth = impl.sdf_grid.has_octree ? impl.sdf_grid.octree.depth : 0;
+    if (impl.sdf_octree_depth > 0 &&
+        impl.sdf_grid.octree.level_offsets.size() >= impl.sdf_octree_depth) {
+        impl.sdf_octree_root_index =
+            impl.sdf_grid.octree.level_offsets[impl.sdf_octree_depth - 1u];
+    } else {
+        impl.sdf_octree_root_index = 0;
+    }
+
+    const std::size_t octree_bytes =
+        (impl.sdf_octree_node_count > 0)
+            ? static_cast<std::size_t>(impl.sdf_octree_node_count) * sizeof(GpuSdfOctreeNode)
+            : sizeof(GpuSdfOctreeNode);
+
     if (impl.sdf_buffer == VK_NULL_HANDLE) {
         VkBufferCreateInfo sdf_info{};
         sdf_info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
@@ -570,6 +627,33 @@ void ensure_sdf_grid(Impl& impl,
                  "vkBindBufferMemory(material_buffer)");
     }
 
+    if (impl.sdf_octree_buffer == VK_NULL_HANDLE) {
+        VkBufferCreateInfo oct_info{};
+        oct_info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+        oct_info.size = octree_bytes;
+        oct_info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+        oct_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+
+        vk_check(vkCreateBuffer(impl.device, &oct_info, nullptr, &impl.sdf_octree_buffer),
+                 "vkCreateBuffer(sdf_octree_buffer)");
+
+        VkMemoryRequirements oct_requirements{};
+        vkGetBufferMemoryRequirements(impl.device, impl.sdf_octree_buffer, &oct_requirements);
+
+        VkMemoryAllocateInfo oct_alloc{};
+        oct_alloc.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+        oct_alloc.allocationSize = oct_requirements.size;
+        oct_alloc.memoryTypeIndex = find_memory_type(
+            impl,
+            oct_requirements.memoryTypeBits,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+
+        vk_check(vkAllocateMemory(impl.device, &oct_alloc, nullptr, &impl.sdf_octree_memory),
+                 "vkAllocateMemory(sdf_octree_memory)");
+        vk_check(vkBindBufferMemory(impl.device, impl.sdf_octree_buffer, impl.sdf_octree_memory, 0),
+                 "vkBindBufferMemory(sdf_octree_buffer)");
+    }
+
     void* mapped_sdf = nullptr;
     vk_check(vkMapMemory(impl.device,
                          impl.sdf_memory,
@@ -590,6 +674,19 @@ void ensure_sdf_grid(Impl& impl,
              "vkMapMemory(material_memory)");
     auto* mat_gpu = static_cast<std::uint32_t*>(mapped_mat);
 
+    GpuSdfOctreeNode* octree_gpu = nullptr;
+    if (impl.sdf_octree_node_count > 0) {
+        void* mapped_oct = nullptr;
+        vk_check(vkMapMemory(impl.device,
+                             impl.sdf_octree_memory,
+                             0,
+                             octree_bytes,
+                             0,
+                             &mapped_oct),
+                 "vkMapMemory(sdf_octree_memory)");
+        octree_gpu = static_cast<GpuSdfOctreeNode*>(mapped_oct);
+    }
+
     if (needs_full_rebuild) {
         // Full rebuild: mirror the entire CPU grid into the GPU buffers.
         for (std::size_t idx = 0; idx < impl.sdf_grid.values.size(); ++idx) {
@@ -609,8 +706,33 @@ void ensure_sdf_grid(Impl& impl,
         impl.sdf_dirty = false;
     }
 
+    // Upload octree nodes if present.
+    if (octree_gpu &&
+        impl.sdf_grid.has_octree &&
+        impl.sdf_octree_node_count <= impl.sdf_grid.octree.nodes.size()) {
+        for (std::uint32_t i = 0; i < impl.sdf_octree_node_count; ++i) {
+            const SdfOctreeNode& src = impl.sdf_grid.octree.nodes[i];
+            GpuSdfOctreeNode& dst = octree_gpu[i];
+            dst.center[0] = src.center.x;
+            dst.center[1] = src.center.y;
+            dst.center[2] = src.center.z;
+            dst.half_size = src.half_size;
+            dst.min_distance = src.min_distance;
+            dst.max_distance = src.max_distance;
+            dst.first_child = src.first_child;
+            dst.occupancy_mask = src.occupancy_mask;
+            dst.flags = src.flags;
+            dst.pad0 = 0u;
+            dst.pad1 = 0u;
+            dst.pad2 = 0u;
+        }
+    }
+
     vkUnmapMemory(impl.device, impl.sdf_memory);
     vkUnmapMemory(impl.device, impl.material_memory);
+    if (octree_gpu) {
+        vkUnmapMemory(impl.device, impl.sdf_octree_memory);
+    }
 
     impl.sdf_dim = impl.sdf_grid.dim;
     impl.sdf_voxel_size = impl.sdf_grid.voxel_size;
@@ -620,7 +742,7 @@ void ensure_sdf_grid(Impl& impl,
     if (impl.descriptor_pool == VK_NULL_HANDLE) {
         VkDescriptorPoolSize pool_size{};
         pool_size.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-        pool_size.descriptorCount = 2;
+        pool_size.descriptorCount = 3;
 
         VkDescriptorPoolCreateInfo pool_info{};
         pool_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
@@ -653,7 +775,12 @@ void ensure_sdf_grid(Impl& impl,
     mat_desc.offset = 0;
     mat_desc.range = mat_count * sizeof(std::uint32_t);
 
-    VkWriteDescriptorSet writes[2]{};
+    VkDescriptorBufferInfo octree_desc{};
+    octree_desc.buffer = impl.sdf_octree_buffer;
+    octree_desc.offset = 0;
+    octree_desc.range = octree_bytes;
+
+    VkWriteDescriptorSet writes[3]{};
 
     writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
     writes[0].dstSet = impl.descriptor_set;
@@ -671,7 +798,15 @@ void ensure_sdf_grid(Impl& impl,
     writes[1].descriptorCount = 1;
     writes[1].pBufferInfo = &mat_desc;
 
-    vkUpdateDescriptorSets(impl.device, 2, writes, 0, nullptr);
+    writes[2].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    writes[2].dstSet = impl.descriptor_set;
+    writes[2].dstBinding = 2;
+    writes[2].dstArrayElement = 0;
+    writes[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    writes[2].descriptorCount = 1;
+    writes[2].pBufferInfo = &octree_desc;
+
+    vkUpdateDescriptorSets(impl.device, 3, writes, 0, nullptr);
 }
 
 void create_command_pool_and_buffers(Impl& impl) {
@@ -772,6 +907,12 @@ VulkanRenderer::~VulkanRenderer() {
     }
     if (impl_->sdf_memory != VK_NULL_HANDLE) {
         vkFreeMemory(impl_->device, impl_->sdf_memory, nullptr);
+    }
+    if (impl_->sdf_octree_buffer != VK_NULL_HANDLE) {
+        vkDestroyBuffer(impl_->device, impl_->sdf_octree_buffer, nullptr);
+    }
+    if (impl_->sdf_octree_memory != VK_NULL_HANDLE) {
+        vkFreeMemory(impl_->device, impl_->sdf_octree_memory, nullptr);
     }
     if (impl_->material_buffer != VK_NULL_HANDLE) {
         vkDestroyBuffer(impl_->device, impl_->material_buffer, nullptr);
@@ -943,6 +1084,19 @@ void VulkanRenderer::draw_frame(const Camera& camera, const world::World& world)
     push.sunColor[1] = 0.98f;
     push.sunColor[2] = 0.92f;
     push.pad2 = 0.0f;
+
+    // Octree metadata for the fragment shader. When no octree is available,
+    // octreeEnabled is 0 and traversal falls back to dense marching.
+    float octree_root_index_f = 0.0f;
+    if (impl_->sdf_octree_node_count > 0 &&
+        impl_->sdf_grid.has_octree) {
+        octree_root_index_f = static_cast<float>(impl_->sdf_octree_root_index);
+    }
+    push.octreeRootIndex = octree_root_index_f;
+    push.octreeMaxDepth = static_cast<float>(impl_->sdf_octree_depth);
+    push.octreeNodeCount = static_cast<float>(impl_->sdf_octree_node_count);
+    push.octreeEnabled =
+        (impl_->sdf_octree_node_count > 0 && impl_->sdf_grid.has_octree) ? 1.0f : 0.0f;
 
     // Record command buffer for this image
     VkCommandBuffer cmd = impl_->command_buffers[image_index];
