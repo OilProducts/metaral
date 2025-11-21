@@ -2,11 +2,17 @@
 
 #include "metaral/world/chunk.hpp"
 #include "metaral/world/chunk_store.hpp"
-#include "metaral/world/terrain.hpp"
 
 #include <memory>
 
 namespace metaral::world {
+
+namespace terrain {
+ChunkData generate_chunk(const core::ChunkCoord& chunk_coord,
+                         const core::CoordinateConfig& cfg,
+                         MaterialId solid_material,
+                         MaterialId empty_material);
+}
 
 // Interface for something that can provide a chunk, possibly from cache or generation.
 class IChunkProvider {

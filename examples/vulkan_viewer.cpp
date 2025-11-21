@@ -5,6 +5,8 @@
 #include "metaral/render/vulkan_renderer.hpp"
 #include "metaral/sim/fluid_system.hpp"
 #include "metaral/world/edit.hpp"
+#include "metaral/world/chunk_provider.hpp"
+#include "metaral/world/chunk_store.hpp"
 #include "metaral/world/terrain.hpp"
 #include "metaral/world/world.hpp"
 
@@ -242,7 +244,18 @@ void VulkanViewer::on_init(const metaral::platform::AppInitContext& ctx) {
         coords_.planet_radius_m / meters_per_chunk;
     const int chunk_radius =
         static_cast<int>(std::ceil(chunks_for_radius)) + 1; // one-chunk margin
-    metaral::world::terrain::generate_planet(*world_, chunk_radius, coords_);
+    // Cached generation: try disk store first, then generate+save on miss.
+    const std::filesystem::path cache_dir = "cache/chunks";
+    auto store = std::make_shared<metaral::world::FileChunkStore>(cache_dir,
+                                                                  coords_,
+                                                                  "terrain_v1");
+    metaral::world::CachedChunkProvider provider{store, coords_, /*solid=*/1, /*empty=*/0};
+    metaral::world::terrain::generate_region_with_provider(*world_,
+                                                           provider,
+                                                           metaral::core::ChunkCoord{-chunk_radius, -chunk_radius, -chunk_radius},
+                                                           metaral::core::ChunkCoord{ chunk_radius,  chunk_radius,  chunk_radius},
+                                                           std::thread::hardware_concurrency(),
+                                                           nullptr);
 
     window_width_ = ctx.window_width;
     window_height_ = ctx.window_height;

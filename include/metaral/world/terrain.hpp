@@ -3,12 +3,14 @@
 #include "metaral/core/coords.hpp"
 #include "metaral/world/world.hpp"
 #include "metaral/world/chunk_inbox.hpp"
-#include "metaral/world/chunk_provider.hpp"
 
 #include <cstddef>
 #include <thread>
 
-namespace metaral::world::terrain {
+namespace metaral::world {
+class IChunkProvider;
+
+namespace terrain {
 
 // Analytic signed-distance field for the noisy sphere terrain.
 // Negative inside the terrain, positive outside.
@@ -48,4 +50,5 @@ void generate_planet(World& world,
                      MaterialId solid_material = 1,
                      MaterialId empty_material = 0);
 
-} // namespace metaral::world::terrain
+} // namespace terrain
+} // namespace metaral::world

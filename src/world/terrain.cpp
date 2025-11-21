@@ -2,6 +2,7 @@
 
 #include "metaral/world/chunk.hpp"
 #include "metaral/core/task/task_pool.hpp"
+#include "metaral/world/chunk_provider.hpp"
 
 #include <cmath>
 #include <iostream>
