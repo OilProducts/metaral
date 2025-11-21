@@ -32,6 +32,7 @@ public:
     Chunk& ensure_chunk_loaded(const core::ChunkCoord& coord);
     Chunk*       find_chunk(const core::ChunkCoord& coord);
     const Chunk* find_chunk(const core::ChunkCoord& coord) const;
+    void         adopt_chunk(ChunkData&& chunk);
 
     Voxel*       find_voxel(const core::WorldVoxelCoord& coord);
     const Voxel* find_voxel(const core::WorldVoxelCoord& coord) const;

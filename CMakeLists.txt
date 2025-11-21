@@ -4,6 +4,8 @@ project(MetaralEngine VERSION 0.1.0 LANGUAGES CXX)
 
 list(APPEND CMAKE_MODULE_PATH "${PROJECT_SOURCE_DIR}/cmake")
 
+find_package(Threads REQUIRED)
+
 set(METARAL_PLATFORM_BACKEND "SDL3" CACHE STRING "Platform backend implementation")
 set_property(CACHE METARAL_PLATFORM_BACKEND PROPERTY STRINGS SDL3)
 

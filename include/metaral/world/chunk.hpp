@@ -19,6 +19,12 @@ struct Chunk {
     std::vector<Voxel> voxels;
 };
 
+// Independently generated chunk payload, prior to inserting into a World.
+struct ChunkData {
+    core::ChunkCoord coord{};
+    std::vector<Voxel> voxels;
+};
+
 struct ChunkAndLocal {
     core::ChunkCoord chunk{};
     core::LocalVoxelCoord local{};

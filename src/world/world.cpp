@@ -1,8 +1,10 @@
 #include "metaral/world/world.hpp"
 #include "metaral/core/coords.hpp"
 
+#include <cassert>
 #include <cmath>
 #include <cstddef>
+#include <utility>
 
 namespace metaral::world {
 
@@ -66,6 +68,18 @@ Voxel& World::get_or_create_voxel(const core::WorldVoxelCoord& coord) {
     Chunk& chunk = get_or_create_chunk(split.chunk);
     const auto idx = voxel_index(config_, split.local);
     return chunk.voxels[idx];
+}
+
+void World::adopt_chunk(ChunkData&& chunk_data) {
+    const auto cs = static_cast<std::size_t>(config_.chunk_size);
+    const auto expected_voxels = cs * cs * cs;
+    assert(chunk_data.voxels.size() == expected_voxels &&
+           "ChunkData voxel count must match chunk_size^3");
+
+    auto [it, inserted] = chunks_.try_emplace(chunk_data.coord);
+    Chunk& chunk = it->second;
+    chunk.coord = chunk_data.coord;
+    chunk.voxels = std::move(chunk_data.voxels);
 }
 
 void fill_sphere(World& world,

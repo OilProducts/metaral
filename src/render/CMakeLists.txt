@@ -16,6 +16,7 @@ target_link_libraries(metaral_render
         metaral_core
         metaral_world
         metaral_sim
+        Threads::Threads
 )
 
 if(METARAL_ENABLE_VULKAN)

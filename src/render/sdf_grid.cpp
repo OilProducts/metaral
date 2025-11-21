@@ -1,11 +1,17 @@
 #include "metaral/render/sdf_grid.hpp"
 
 #include "metaral/world/chunk.hpp"
+#include "metaral/core/task/task_pool.hpp"
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cmath>
+#include <iostream>
 #include <limits>
 #include <queue>
+#include <latch>
+#include <vector>
 
 namespace metaral::render {
 
@@ -26,7 +32,9 @@ constexpr float kSdfSmoothBandCells = 2.0f;
 constexpr std::uint32_t kSdfOctreeLeafBlockDim = 4; // voxels per leaf edge
 constexpr std::uint32_t kSdfOctreeMaxLevels    = 6; // not counting the dense grid
 
-// Chamfer mask costs for 3D 26-neighborhood: face, edge, corner.
+constexpr float kInf = std::numeric_limits<float>::infinity();
+
+// Chamfer costs used by the incremental region updater.
 constexpr float kChamferFaceCost   = 1.0f;
 constexpr float kChamferEdgeCost   = 1.41421356237f; // sqrt(2)
 constexpr float kChamferCornerCost = 1.73205080757f; // sqrt(3)
@@ -40,19 +48,6 @@ inline std::size_t linear_index(std::uint32_t dim,
             static_cast<std::size_t>(y)) *
                dim +
            static_cast<std::size_t>(x);
-}
-
-inline void decode_linear_index(std::uint32_t dim,
-                                std::uint32_t index,
-                                std::uint32_t& x,
-                                std::uint32_t& y,
-                                std::uint32_t& z) noexcept
-{
-    const std::uint32_t slice = dim * dim;
-    z = index / slice;
-    const std::uint32_t rem = index % slice;
-    y = rem / dim;
-    x = rem % dim;
 }
 
 inline float dot3(const core::PlanetPosition& a,
@@ -123,115 +118,194 @@ static constexpr NeighborOffset kNeighbors[] = {
     {-1, -1, -1, kChamferCornerCost},
 };
 
-// Run a chamfer-distance Dijkstra over a full dim^3 volume using the
-// occupancy buffer (1=solid,0=empty). Produces unsigned distances in "cell"
-// units in out_dist; sign is applied later based on occupancy.
-void compute_chamfer_sdf_full(const std::vector<std::uint8_t>& occupancy,
-                              std::uint32_t dim,
-                              std::vector<float>& out_dist)
+// 1D exact squared distance transform (Felzenszwalb/Huttenlocher).
+void edt_1d_inplace(float* f, std::uint32_t n) {
+    bool has_seed = false;
+    for (std::uint32_t i = 0; i < n; ++i) {
+        if (f[i] == 0.0f) { // seeds are zero
+            has_seed = true;
+            break;
+        }
+    }
+    if (!has_seed) {
+        return; // leave as large constant
+    }
+
+    struct Scratch {
+        std::vector<int> v;
+        std::vector<float> z;
+        std::vector<float> g;
+    };
+    thread_local Scratch scratch;
+    scratch.v.resize(n);
+    scratch.z.resize(static_cast<std::size_t>(n) + 1);
+    scratch.g.resize(n);
+
+    std::vector<int>& v = scratch.v;
+    std::vector<float>& z = scratch.z;
+    std::vector<float>& g = scratch.g;
+
+    int k = 0;
+    v[0] = 0;
+    z[0] = -kInf;
+    z[1] = kInf;
+
+    for (std::uint32_t q = 1; q < n; ++q) {
+        float s = ((f[q] + static_cast<float>(q) * static_cast<float>(q)) -
+                   (f[static_cast<std::uint32_t>(v[k])] +
+                    static_cast<float>(v[k]) * static_cast<float>(v[k]))) /
+                  (2.0f * static_cast<float>(q - v[k]));
+        while (s <= z[k]) {
+            --k;
+            s = ((f[q] + static_cast<float>(q) * static_cast<float>(q)) -
+                 (f[static_cast<std::uint32_t>(v[k])] +
+                  static_cast<float>(v[k]) * static_cast<float>(v[k]))) /
+                (2.0f * static_cast<float>(q - v[k]));
+        }
+        ++k;
+        v[k] = static_cast<int>(q);
+        z[k] = s;
+        z[k + 1] = kInf;
+    }
+
+    k = 0;
+    for (std::uint32_t q = 0; q < n; ++q) {
+        while (z[k + 1] < static_cast<float>(q)) {
+            ++k;
+        }
+        const float dx = static_cast<float>(q - v[k]);
+        g[q] = dx * dx + f[static_cast<std::uint32_t>(v[k])];
+    }
+
+    for (std::uint32_t i = 0; i < n; ++i) {
+        f[i] = g[i];
+    }
+}
+
+// Exact unsigned squared distance to the nearest occupancy boundary voxel.
+// Seeds are voxels that differ from any 6-connected neighbor.
+void compute_edt_3d(const std::vector<std::uint8_t>& occupancy,
+                    std::uint32_t dim,
+                    std::vector<float>& out_dist_sq,
+                    core::TaskPool& pool)
 {
+    pool.start(0); // ensure threads are running
     const std::size_t cell_count = static_cast<std::size_t>(dim) * dim * dim;
-    out_dist.assign(cell_count, std::numeric_limits<float>::infinity());
+    const float max_sq_dist = static_cast<float>(dim) * static_cast<float>(dim) * 3.0f;
+    out_dist_sq.assign(cell_count, max_sq_dist);
 
-    std::priority_queue<DistanceNode,
-                        std::vector<DistanceNode>,
-                        DistanceCompare> queue;
+    auto boundary_index = [dim](std::uint32_t x, std::uint32_t y, std::uint32_t z) noexcept {
+        return (static_cast<std::size_t>(z) * dim + static_cast<std::size_t>(y)) * dim +
+               static_cast<std::size_t>(x);
+    };
 
-    // Seed boundary cells (where occupancy differs from any 6-connected neighbor)
+    // Seed boundaries.
     for (std::uint32_t z = 0; z < dim; ++z) {
         for (std::uint32_t y = 0; y < dim; ++y) {
             for (std::uint32_t x = 0; x < dim; ++x) {
-                const std::size_t idx = linear_index(dim, x, y, z);
+                const std::size_t idx = boundary_index(x, y, z);
                 const std::uint8_t center = occupancy[idx];
 
                 bool is_boundary = false;
                 if (x > 0) {
-                    const std::size_t nidx = linear_index(dim, x - 1, y, z);
-                    if (occupancy[nidx] != center) {
-                        is_boundary = true;
-                    }
+                    if (occupancy[idx - 1] != center) is_boundary = true;
                 }
                 if (!is_boundary && x + 1 < dim) {
-                    const std::size_t nidx = linear_index(dim, x + 1, y, z);
-                    if (occupancy[nidx] != center) {
-                        is_boundary = true;
-                    }
+                    if (occupancy[idx + 1] != center) is_boundary = true;
                 }
                 if (!is_boundary && y > 0) {
-                    const std::size_t nidx = linear_index(dim, x, y - 1, z);
-                    if (occupancy[nidx] != center) {
-                        is_boundary = true;
-                    }
+                    if (occupancy[idx - dim] != center) is_boundary = true;
                 }
                 if (!is_boundary && y + 1 < dim) {
-                    const std::size_t nidx = linear_index(dim, x, y + 1, z);
-                    if (occupancy[nidx] != center) {
-                        is_boundary = true;
-                    }
+                    if (occupancy[idx + dim] != center) is_boundary = true;
                 }
                 if (!is_boundary && z > 0) {
-                    const std::size_t nidx = linear_index(dim, x, y, z - 1);
-                    if (occupancy[nidx] != center) {
-                        is_boundary = true;
-                    }
+                    if (occupancy[idx - static_cast<std::size_t>(dim) * dim] != center) is_boundary = true;
                 }
                 if (!is_boundary && z + 1 < dim) {
-                    const std::size_t nidx = linear_index(dim, x, y, z + 1);
-                    if (occupancy[nidx] != center) {
-                        is_boundary = true;
-                    }
+                    if (occupancy[idx + static_cast<std::size_t>(dim) * dim] != center) is_boundary = true;
                 }
 
                 if (is_boundary) {
-                    out_dist[idx] = 0.0f;
-                    queue.push(DistanceNode{0.0f, static_cast<std::uint32_t>(idx)});
+                    out_dist_sq[idx] = 0.0f;
                 }
             }
         }
     }
 
-    if (queue.empty()) {
-        // Degenerate case: entirely solid or entirely empty. Distances remain
-        // infinite and will be handled by the caller.
-        return;
-    }
+    // Helper to parallelize a set of lines using the task pool.
+    auto parallel_lines = [&](std::size_t line_count, auto&& func) {
+        const std::size_t workers = pool.worker_count() == 0 ? 1u : pool.worker_count();
+        std::atomic<std::size_t> next{0};
+        std::latch latch(static_cast<std::ptrdiff_t>(workers));
 
-    while (!queue.empty()) {
-        const DistanceNode node = queue.top();
-        queue.pop();
-
-        if (node.distance > out_dist[node.index]) {
-            continue; // outdated entry
+        for (std::size_t w = 0; w < workers; ++w) {
+            pool.submit([&](std::stop_token st) {
+                while (!st.stop_requested()) {
+                    const std::size_t line_idx = next.fetch_add(1, std::memory_order_relaxed);
+                    if (line_idx >= line_count) {
+                        break;
+                    }
+                    func(line_idx);
+                }
+                latch.count_down();
+            });
         }
 
-        std::uint32_t x, y, z;
-        decode_linear_index(dim, node.index, x, y, z);
+        latch.wait();
+    };
 
-        for (const NeighborOffset& n : kNeighbors) {
-            const int nx = static_cast<int>(x) + n.dx;
-            const int ny = static_cast<int>(y) + n.dy;
-            const int nz = static_cast<int>(z) + n.dz;
+    // Pass 1: X axis (contiguous lines).
+    const std::size_t line_count_x = static_cast<std::size_t>(dim) * dim;
+    parallel_lines(line_count_x, [&](std::size_t line_idx) {
+        const std::uint32_t y = static_cast<std::uint32_t>(line_idx % dim);
+        const std::uint32_t z = static_cast<std::uint32_t>(line_idx / dim);
+        float* line = out_dist_sq.data() + boundary_index(0, y, z);
+        edt_1d_inplace(line, dim);
+    });
+    // Pass 1: X axis (contiguous lines).
 
-            if (nx < 0 || ny < 0 || nz < 0 ||
-                nx >= static_cast<int>(dim) ||
-                ny >= static_cast<int>(dim) ||
-                nz >= static_cast<int>(dim)) {
-                continue;
-            }
+    // Pass 2: Y axis (requires stride copy).
+    const std::size_t line_count_y = static_cast<std::size_t>(dim) * dim;
+    parallel_lines(line_count_y, [&](std::size_t line_idx) {
+        const std::uint32_t x = static_cast<std::uint32_t>(line_idx % dim);
+        const std::uint32_t z = static_cast<std::uint32_t>(line_idx / dim);
 
-            const std::size_t nidx = linear_index(
-                dim,
-                static_cast<std::uint32_t>(nx),
-                static_cast<std::uint32_t>(ny),
-                static_cast<std::uint32_t>(nz));
+        thread_local std::vector<float> tmp;
+        tmp.resize(dim);
 
-            const float new_dist = node.distance + n.cost;
-            if (new_dist < out_dist[nidx]) {
-                out_dist[nidx] = new_dist;
-                queue.push(DistanceNode{new_dist, static_cast<std::uint32_t>(nidx)});
-            }
+        const std::size_t base = static_cast<std::size_t>(z) * dim * dim + x;
+        for (std::uint32_t y = 0; y < dim; ++y) {
+            tmp[y] = out_dist_sq[base + static_cast<std::size_t>(y) * dim];
         }
-    }
+
+        edt_1d_inplace(tmp.data(), dim);
+
+        for (std::uint32_t y = 0; y < dim; ++y) {
+            out_dist_sq[base + static_cast<std::size_t>(y) * dim] = tmp[y];
+        }
+    });
+    // Pass 3: Z axis (requires stride copy).
+    const std::size_t line_count_z = static_cast<std::size_t>(dim) * dim;
+    parallel_lines(line_count_z, [&](std::size_t line_idx) {
+        const std::uint32_t x = static_cast<std::uint32_t>(line_idx % dim);
+        const std::uint32_t y = static_cast<std::uint32_t>(line_idx / dim);
+
+        thread_local std::vector<float> tmp;
+        tmp.resize(dim);
+
+        for (std::uint32_t z = 0; z < dim; ++z) {
+            const std::size_t idx = boundary_index(x, y, z);
+            tmp[z] = out_dist_sq[idx];
+        }
+
+        edt_1d_inplace(tmp.data(), dim);
+
+        for (std::uint32_t z = 0; z < dim; ++z) {
+            const std::size_t idx = boundary_index(x, y, z);
+            out_dist_sq[idx] = tmp[z];
+        }
+    });
 }
 
 // Simple 3x3x3 box blur applied to the SDF values near the surface. This
@@ -625,6 +699,11 @@ void build_sdf_grid_from_world(const world::World& world,
                                const core::CoordinateConfig& cfg,
                                SdfGrid& out)
 {
+    const auto log_ms = [](const char* label, auto start, auto end) {
+        const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+        std::cout << "[sdf] " << label << " took " << ms << " ms\n";
+    };
+
     const float voxel_size = kSdfVoxelSizeMeters;
 
     // Expand the SDF grid so that the sampled region comfortably covers the
@@ -651,43 +730,88 @@ void build_sdf_grid_from_world(const world::World& world,
     const float grid_min = -half_extent;
 
     // First pass: populate occupancy and materials from the voxel world.
-    for (std::uint32_t z_index = 0; z_index < dim; ++z_index) {
-        for (std::uint32_t y_index = 0; y_index < dim; ++y_index) {
-            for (std::uint32_t x_index = 0; x_index < dim; ++x_index) {
-                const float x = grid_min + (static_cast<float>(x_index) + 0.5f) * voxel_size;
-                const float y = grid_min + (static_cast<float>(y_index) + 0.5f) * voxel_size;
-                const float z = grid_min + (static_cast<float>(z_index) + 0.5f) * voxel_size;
-
-                const core::PlanetPosition pos{x, y, z};
-                const core::WorldVoxelCoord world_voxel =
-                    core::to_world_voxel(pos, cfg);
-
-                const world::Voxel* voxel = world.find_voxel(world_voxel);
-                const bool solid = voxel && voxel->material != 0;
-
-                const std::size_t idx =
-                    linear_index(dim, x_index, y_index, z_index);
-
-                std::uint16_t material_id = 0;
-                if (solid && voxel) {
-                    material_id = static_cast<std::uint16_t>(voxel->material);
-                }
-                out.materials[idx] = material_id;
-                out.occupancy[idx] = solid ? 1u : 0u;
-            }
-        }
+    auto& pool = core::global_task_pool();
+    pool.start(0); // no-op if already started
+    std::size_t worker_count = pool.worker_count();
+    if (worker_count == 0) {
+        worker_count = 1;
+    }
+    if (worker_count > dim) {
+        worker_count = dim;
     }
 
-    // Second pass: compute unsigned distance in cell units with a chamfer
-    // metric, then apply sign and convert to meters.
-    std::vector<float> dist_cells;
-    compute_chamfer_sdf_full(out.occupancy, dim, dist_cells);
+    std::atomic<std::uint32_t> next_z{0};
+    std::latch latch(static_cast<std::ptrdiff_t>(worker_count));
+
+    std::cout << "[sdf] occupancy fill on " << worker_count
+              << " worker(s)\n";
+
+    const auto occ_start = std::chrono::steady_clock::now();
+
+    for (std::size_t w = 0; w < worker_count; ++w) {
+        pool.submit([&, voxel_size, grid_min](std::stop_token st) {
+            while (!st.stop_requested()) {
+                const std::uint32_t z_index = next_z.fetch_add(1, std::memory_order_relaxed);
+                if (z_index >= dim) {
+                    break;
+                }
+
+                const float z = grid_min + (static_cast<float>(z_index) + 0.5f) * voxel_size;
+
+                for (std::uint32_t y_index = 0; y_index < dim; ++y_index) {
+                    const float y = grid_min + (static_cast<float>(y_index) + 0.5f) * voxel_size;
+
+                    for (std::uint32_t x_index = 0; x_index < dim; ++x_index) {
+                        const float x = grid_min + (static_cast<float>(x_index) + 0.5f) * voxel_size;
+
+                        const core::PlanetPosition pos{x, y, z};
+                        const core::WorldVoxelCoord world_voxel =
+                            core::to_world_voxel(pos, cfg);
+
+                        const world::Voxel* voxel = world.find_voxel(world_voxel);
+                        const bool solid = voxel && voxel->material != 0;
+
+                        const std::size_t idx =
+                            linear_index(dim, x_index, y_index, z_index);
+
+                        std::uint16_t material_id = 0;
+                        if (solid && voxel) {
+                            material_id = static_cast<std::uint16_t>(voxel->material);
+                        }
+                        out.materials[idx] = material_id;
+                        out.occupancy[idx] = solid ? 1u : 0u;
+                    }
+                }
+            }
+            latch.count_down();
+        });
+    }
+
+    latch.wait();
+    log_ms("occupancy fill", occ_start, std::chrono::steady_clock::now());
+
+    // Second pass: compute exact unsigned distance in cell units (squared),
+    // then apply sign and convert to meters.
+    const auto edt_start = std::chrono::steady_clock::now();
+    std::vector<float> dist_sq_cells;
+    compute_edt_3d(out.occupancy, dim, dist_sq_cells, pool);
+    const float max_reasonable = static_cast<float>(dim) * static_cast<float>(dim) * 3.0f;
+    for (float& v : dist_sq_cells) {
+        if (v > max_reasonable || !std::isfinite(v)) {
+            v = max_reasonable;
+        }
+        if (v < 0.0f) {
+            v = 0.0f;
+        }
+    }
+    log_ms("edt distance", edt_start, std::chrono::steady_clock::now());
 
     const float cell_to_meters = voxel_size;
 
+    const auto sign_start = std::chrono::steady_clock::now();
     for (std::size_t idx = 0; idx < cell_count; ++idx) {
-        const float d_cells = dist_cells[idx];
-        if (!std::isfinite(d_cells)) {
+        const float d_cells_sq = dist_sq_cells[idx];
+        if (!std::isfinite(d_cells_sq)) {
             // No boundary found (degenerate case). Treat distance as zero so
             // that sample_sdf falls back to the analytic radial SDF outside
             // the grid.
@@ -695,19 +819,25 @@ void build_sdf_grid_from_world(const world::World& world,
             continue;
         }
 
+        const float d_cells = std::sqrt(d_cells_sq);
         const float d_meters = d_cells * cell_to_meters;
         const bool solid = out.occupancy[idx] != 0;
         out.values[idx] = solid ? -d_meters : d_meters;
     }
+    log_ms("sign/apply distance", sign_start, std::chrono::steady_clock::now());
 
     // Apply a small smoothing kernel near the surface to visually soften
     // voxel-scale artifacts in the raymarched geometry.
+    const auto smooth_start = std::chrono::steady_clock::now();
     smooth_sdf_full(out);
+    log_ms("smoothing", smooth_start, std::chrono::steady_clock::now());
 
     // Build a conservative octree over the finished grid to accelerate
     // raymarching. If construction fails for any reason, the grid simply
     // reports has_octree == false and traversal falls back to the dense SDF.
+    const auto octree_start = std::chrono::steady_clock::now();
     build_sdf_octree_full(out, out);
+    log_ms("octree build", octree_start, std::chrono::steady_clock::now());
 }
 
 float sample_sdf(const SdfGrid& grid,

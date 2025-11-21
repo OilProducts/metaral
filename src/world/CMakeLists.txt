@@ -12,6 +12,7 @@ set_target_properties(metaral_world PROPERTIES
 target_link_libraries(metaral_world
     PUBLIC
         metaral_core
+        Threads::Threads
 )
 
 target_include_directories(metaral_world PUBLIC ${PROJECT_SOURCE_DIR}/include)
