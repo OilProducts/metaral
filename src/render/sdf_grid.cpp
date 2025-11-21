@@ -25,7 +25,7 @@ constexpr float kSdfVoxelSizeMeters = .5f;
 constexpr float kSdfMarginVoxels = 40.0f;
 // Width of the band (in cells) around the surface within which we smooth
 // the signed-distance field. Keeps far-field distances unchanged.
-constexpr float kSdfSmoothBandCells = 2.0f;
+constexpr float kSdfSmoothBandCells = 4.0f;
 
 // Octree configuration. These values are intentionally conservative and can be
 // tuned once the basic traversal is in place.
