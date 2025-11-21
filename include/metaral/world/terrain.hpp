@@ -2,6 +2,7 @@
 
 #include "metaral/core/coords.hpp"
 #include "metaral/world/world.hpp"
+#include "metaral/world/chunk_inbox.hpp"
 
 #include <cstddef>
 #include <thread>
@@ -27,7 +28,8 @@ void generate_region(World& world,
                      const core::CoordinateConfig& cfg,
                      MaterialId solid_material = 1,
                      MaterialId empty_material = 0,
-                     std::size_t worker_count = std::thread::hardware_concurrency());
+                     std::size_t worker_count = std::thread::hardware_concurrency(),
+                     ChunkInbox* inbox = nullptr);
 
 // Simple planet generator that writes voxel materials into a World using the
 // analytic terrain field.

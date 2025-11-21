@@ -71,7 +71,8 @@ void generate_region(World& world,
                      const core::CoordinateConfig& cfg,
                      MaterialId solid_material,
                      MaterialId empty_material,
-                      std::size_t worker_count)
+                     std::size_t worker_count,
+                     ChunkInbox* inbox)
 {
     // Flatten the request space into a list we can index atomically.
     std::vector<core::ChunkCoord> coords;
@@ -88,8 +89,6 @@ void generate_region(World& world,
     }
 
     const std::size_t job_count = coords.size();
-    std::vector<ChunkData> results(job_count);
-
     if (job_count == 0) {
         return;
     }
@@ -99,6 +98,12 @@ void generate_region(World& world,
     worker_count = pool.worker_count();
     if (worker_count > job_count) {
         worker_count = job_count;
+    }
+
+    const bool use_inbox = inbox != nullptr;
+    std::vector<ChunkData> results;
+    if (!use_inbox) {
+        results.resize(job_count);
     }
 
     std::cout << "[terrain] generate_region: " << job_count
@@ -111,8 +116,13 @@ void generate_region(World& world,
     for (std::size_t idx = 0; idx < job_count; ++idx) {
         pool.submit([&, idx](std::stop_token) {
             const core::ChunkCoord coord = coords[idx];
-            results[idx] =
+            ChunkData chunk =
                 generate_chunk(coord, cfg, solid_material, empty_material);
+            if (use_inbox) {
+                inbox->push(std::move(chunk));
+            } else {
+                results[idx] = std::move(chunk);
+            }
             done.count_down();
         });
     }
@@ -122,8 +132,10 @@ void generate_region(World& world,
     const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - dispatch_start).count();
     std::cout << "[terrain] region complete in " << ms << " ms\n";
 
-    for (auto& chunk : results) {
-        world.adopt_chunk(std::move(chunk));
+    if (!use_inbox) {
+        for (auto& chunk : results) {
+            world.adopt_chunk(std::move(chunk));
+        }
     }
 }
 
