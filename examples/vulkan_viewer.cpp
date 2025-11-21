@@ -7,6 +7,8 @@
 #include "metaral/world/edit.hpp"
 #include "metaral/world/chunk_provider.hpp"
 #include "metaral/world/chunk_store.hpp"
+#include "metaral/world/chunk_inbox.hpp"
+#include "metaral/world/chunk_streamer.hpp"
 #include "metaral/world/terrain.hpp"
 #include "metaral/world/world.hpp"
 
@@ -200,9 +202,12 @@ private:
     std::unique_ptr<metaral::world::World> world_;
     std::unique_ptr<metaral::render::VulkanRenderer> renderer_;
     std::unique_ptr<metaral::sim::FluidSystem> fluid_;
+    std::unique_ptr<metaral::world::ChunkStreamer> streamer_;
+    std::shared_ptr<metaral::world::IChunkProvider> provider_;
     bool fluid_enabled_ = false;
     bool fluid_spawned_ = false;
     metaral::render::Camera camera_{};
+    metaral::world::ChunkInbox chunk_inbox_{};
     int window_width_ = 0;
     int window_height_ = 0;
     MovementMode mode_ = MovementMode::FreeFly;
@@ -244,18 +249,25 @@ void VulkanViewer::on_init(const metaral::platform::AppInitContext& ctx) {
         coords_.planet_radius_m / meters_per_chunk;
     const int chunk_radius =
         static_cast<int>(std::ceil(chunks_for_radius)) + 1; // one-chunk margin
-    // Cached generation: try disk store first, then generate+save on miss.
+    // Cached provider for streaming and initial fill; save to disk on misses.
     const std::filesystem::path cache_dir = "cache/chunks";
     auto store = std::make_shared<metaral::world::FileChunkStore>(cache_dir,
                                                                   coords_,
                                                                   "terrain_v1");
-    metaral::world::CachedChunkProvider provider{store, coords_, /*solid=*/1, /*empty=*/0};
-    metaral::world::terrain::generate_region_with_provider(*world_,
-                                                           provider,
-                                                           metaral::core::ChunkCoord{-chunk_radius, -chunk_radius, -chunk_radius},
-                                                           metaral::core::ChunkCoord{ chunk_radius,  chunk_radius,  chunk_radius},
-                                                           std::thread::hardware_concurrency(),
-                                                           nullptr);
+    provider_ = std::make_shared<metaral::world::CachedChunkProvider>(
+        store, coords_, /*solid=*/1, /*empty=*/0);
+
+    // Streamer handles ongoing loads; do an initial synchronous fill via inbox.
+    streamer_ = std::make_unique<metaral::world::ChunkStreamer>(provider_,
+                                                                *world_,
+                                                                chunk_inbox_,
+                                                                metaral::world::StreamerConfig{
+                                                                    .load_radius = chunk_radius,
+                                                                    .keep_radius = chunk_radius + 1,
+                                                                    .worker_count = std::thread::hardware_concurrency()
+                                                                });
+    streamer_->update(metaral::core::ChunkCoord{0, 0, 0});
+    streamer_->drain();
 
     window_width_ = ctx.window_width;
     window_height_ = ctx.window_height;
@@ -298,6 +310,20 @@ void VulkanViewer::on_frame(const metaral::platform::FrameContext& ctx) {
 
     if (!renderer_) {
         return;
+    }
+
+    // Integrate any completed background chunk work.
+    if (world_) {
+        metaral::world::adopt_all(*world_, chunk_inbox_);
+    }
+
+    // Run streaming: request/load chunks around the camera.
+    if (streamer_ && world_) {
+        const metaral::core::WorldVoxelCoord cam_voxel =
+            metaral::core::to_world_voxel(camera_.position, coords_);
+        const metaral::world::ChunkAndLocal split =
+            metaral::world::split_world_voxel(cam_voxel, coords_);
+        streamer_->update(split.chunk);
     }
 
     const float dt = ctx.dt_seconds;

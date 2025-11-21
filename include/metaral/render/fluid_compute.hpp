@@ -33,6 +33,9 @@ public:
                     uint32_t queue_family_index,
                     const FluidGpuParams& params);
 
+    // Refresh storage-buffer descriptor bindings defensively.
+    void refresh_descriptor_set();
+
     bool initialized() const noexcept { return initialized_; }
 
     // Dispatches a minimal step (external forces + integrate) for `count`

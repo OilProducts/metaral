@@ -8,11 +8,11 @@
 
 namespace metaral::world {
 
-ChunkStreamer::ChunkStreamer(IChunkProvider& provider,
+ChunkStreamer::ChunkStreamer(std::shared_ptr<IChunkProvider> provider,
                              World& world,
                              ChunkInbox& inbox,
                              StreamerConfig cfg)
-    : provider_(provider)
+    : provider_(std::move(provider))
     , world_(world)
     , inbox_(inbox)
     , cfg_(cfg)
@@ -20,6 +20,21 @@ ChunkStreamer::ChunkStreamer(IChunkProvider& provider,
 
 bool ChunkStreamer::is_loaded(const core::ChunkCoord& coord) const {
     return world_.find_chunk(coord) != nullptr;
+}
+
+bool ChunkStreamer::is_in_flight(const core::ChunkCoord& coord) {
+    std::lock_guard lock(in_flight_mutex_);
+    return in_flight_.contains(coord);
+}
+
+void ChunkStreamer::add_in_flight(const core::ChunkCoord& coord) {
+    std::lock_guard lock(in_flight_mutex_);
+    in_flight_.insert(coord);
+}
+
+void ChunkStreamer::remove_in_flight(const core::ChunkCoord& coord) {
+    std::lock_guard lock(in_flight_mutex_);
+    in_flight_.erase(coord);
 }
 
 void ChunkStreamer::enqueue_missing(const core::ChunkCoord& camera_chunk) {
@@ -36,13 +51,13 @@ void ChunkStreamer::enqueue_missing(const core::ChunkCoord& camera_chunk) {
                 if (is_loaded(coord)) {
                     continue;
                 }
-                if (in_flight_.contains(coord)) {
+                if (is_in_flight(coord)) {
                     continue;
                 }
 
                 const int dist2 = dx*dx + dy*dy + dz*dz;
                 queue_.push(Request{coord, dist2});
-                in_flight_.insert(coord);
+                add_in_flight(coord);
             }
         }
     }
@@ -81,9 +96,9 @@ void ChunkStreamer::update(const core::ChunkCoord& camera_chunk) {
         queue_.pop();
 
         pool.submit([this, coord=req.coord](std::stop_token) {
-            ChunkData chunk = provider_.get(coord);
+            ChunkData chunk = provider_->get(coord);
             inbox_.push(std::move(chunk));
-            in_flight_.erase(coord);
+            remove_in_flight(coord);
         });
     }
 

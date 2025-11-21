@@ -19,7 +19,7 @@ struct StreamerConfig {
 
 class ChunkStreamer {
 public:
-    ChunkStreamer(IChunkProvider& provider,
+    ChunkStreamer(std::shared_ptr<IChunkProvider> provider,
                   World& world,
                   ChunkInbox& inbox,
                   StreamerConfig cfg = {});
@@ -45,17 +45,22 @@ private:
         }
     };
 
+    bool is_in_flight(const core::ChunkCoord& coord);
+    void add_in_flight(const core::ChunkCoord& coord);
+    void remove_in_flight(const core::ChunkCoord& coord);
+
     void enqueue_missing(const core::ChunkCoord& camera_chunk);
     void unload_far(const core::ChunkCoord& camera_chunk);
     bool is_loaded(const core::ChunkCoord& coord) const;
 
-    IChunkProvider& provider_;
+    std::shared_ptr<IChunkProvider> provider_;
     World& world_;
     ChunkInbox& inbox_;
     StreamerConfig cfg_;
 
     std::priority_queue<Request, std::vector<Request>, RequestCompare> queue_;
     std::unordered_set<core::ChunkCoord, ChunkKeyHash, ChunkCoordEqual> in_flight_;
+    std::mutex in_flight_mutex_;
 };
 
 } // namespace metaral::world

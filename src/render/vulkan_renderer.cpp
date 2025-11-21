@@ -163,6 +163,15 @@ void create_logical_device_and_queue(Impl& impl) {
     device_info.enabledExtensionCount = 1;
     device_info.ppEnabledExtensionNames = device_extensions;
 
+    // Prefer robust buffer access to guard against any stray GPU-side OOB reads/writes.
+    VkPhysicalDeviceFeatures supported{};
+    vkGetPhysicalDeviceFeatures(impl.physical_device, &supported);
+    VkPhysicalDeviceFeatures requested{};
+    if (supported.robustBufferAccess) {
+        requested.robustBufferAccess = VK_TRUE;
+        device_info.pEnabledFeatures = &requested;
+    }
+
     vk_check(vkCreateDevice(impl.physical_device, &device_info, nullptr, &impl.device), "vkCreateDevice");
     vkGetDeviceQueue(impl.device, impl.graphics_queue_family, 0, &impl.graphics_queue);
 }

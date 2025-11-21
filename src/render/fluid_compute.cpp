@@ -67,6 +67,23 @@ inline uint32_t cpu_hash(int32_t x, int32_t y, int32_t z) {
     return vx ^ vy ^ vz;
 }
 
+// Keep CPU-side push constants in sync with FluidPush in shaders/fluid_common.glsl
+struct FluidPushConstants {
+    float deltaTime;
+    float smoothingRadius;
+    float targetDensity;
+    float pressureMultiplier;
+    float nearPressureMultiplier;
+    float viscosityStrength;
+    float gravity;
+    uint32_t numParticles;
+    uint32_t aux0;
+    uint32_t aux1;
+    uint32_t aux2;
+};
+static_assert(sizeof(FluidPushConstants) == 44,
+              "CPU/GPU Fluid push constants drifted; update both sides together.");
+
 } // namespace
 
 FluidComputeContext::~FluidComputeContext() {
@@ -109,6 +126,59 @@ void FluidComputeContext::destroy() {
 
     device_ = VK_NULL_HANDLE;
     initialized_ = false;
+}
+
+void FluidComputeContext::refresh_descriptor_set() {
+    if (!device_ || descriptor_set_ == VK_NULL_HANDLE) {
+        return;
+    }
+    // All buffers must be valid before updating descriptors.
+    if (positions_a_ == VK_NULL_HANDLE || positions_b_ == VK_NULL_HANDLE ||
+        keys_ == VK_NULL_HANDLE || indices_ == VK_NULL_HANDLE ||
+        range_starts_ == VK_NULL_HANDLE || range_ends_ == VK_NULL_HANDLE ||
+        densities_ == VK_NULL_HANDLE) {
+        return;
+    }
+
+    const VkDeviceSize particle_bytes = sizeof(float) * 8;
+    const VkDeviceSize positions_size = particle_bytes * max_particles_;
+    const VkDeviceSize scalar_u_size = sizeof(uint32_t) * max_particles_;
+    const VkDeviceSize density_size = sizeof(float) * 2 * max_particles_;
+
+    std::vector<VkDescriptorBufferInfo> infos;
+    infos.reserve(8);
+    auto add_info = [&](VkBuffer buf, VkDeviceSize size) {
+        VkDescriptorBufferInfo bi{};
+        bi.buffer = buf;
+        bi.offset = 0;
+        bi.range = size;
+        infos.push_back(bi);
+        return &infos.back();
+    };
+
+    std::vector<VkWriteDescriptorSet> writes;
+    writes.reserve(8);
+    auto add_write = [&](uint32_t binding, const VkDescriptorBufferInfo* info_ptr) {
+        VkWriteDescriptorSet w{};
+        w.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        w.dstSet = descriptor_set_;
+        w.dstBinding = binding;
+        w.descriptorCount = 1;
+        w.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        w.pBufferInfo = info_ptr;
+        writes.push_back(w);
+    };
+
+    add_write(0, add_info(positions_a_, positions_size));
+    add_write(1, add_info(positions_b_, positions_size));
+    add_write(2, add_info(keys_, scalar_u_size));
+    add_write(3, add_info(indices_, scalar_u_size));
+    add_write(4, add_info(positions_a_, positions_size)); // sorted output buffer
+    add_write(5, add_info(range_starts_, scalar_u_size));
+    add_write(6, add_info(range_ends_, scalar_u_size));
+    add_write(7, add_info(densities_, density_size));
+
+    vkUpdateDescriptorSets(device_, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
 }
 
 VkPipeline FluidComputeContext::create_compute_pipeline(const char* spv_path) {
@@ -214,7 +284,7 @@ void FluidComputeContext::initialize(VkDevice device,
     VkPushConstantRange push{};
     push.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
     push.offset = 0;
-    push.size = sizeof(float) * 7 + sizeof(uint32_t); // matches FluidPush in shader
+    push.size = sizeof(FluidPushConstants); // matches FluidPush in shader
 
     layout_info.setLayoutCount = 1;
     layout_info.pSetLayouts = &set_layout_;
@@ -262,33 +332,7 @@ void FluidComputeContext::initialize(VkDevice device,
     create_storage_buffer(density_size, densities_, densities_mem_);
 
     // Descriptor writes
-    auto write = [&](uint32_t binding, VkBuffer buf, VkDeviceSize size) {
-        VkDescriptorBufferInfo buf_info{};
-        buf_info.buffer = buf;
-        buf_info.offset = 0;
-        buf_info.range = size;
-
-        VkWriteDescriptorSet w{};
-        w.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        w.dstSet = descriptor_set_;
-        w.dstBinding = binding;
-        w.descriptorCount = 1;
-        w.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-        w.pBufferInfo = &buf_info;
-        return w;
-    };
-
-    std::vector<VkWriteDescriptorSet> writes;
-    writes.push_back(write(0, positions_a_, positions_size));
-    writes.push_back(write(1, positions_b_, positions_size));
-    writes.push_back(write(2, keys_, scalar_u_size));
-    writes.push_back(write(3, indices_, scalar_u_size));
-    writes.push_back(write(4, positions_a_, positions_size)); // sorted output buffer
-    writes.push_back(write(5, range_starts_, scalar_u_size));
-    writes.push_back(write(6, range_ends_, scalar_u_size));
-    writes.push_back(write(7, densities_, density_size));
-
-    vkUpdateDescriptorSets(device_, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
+    refresh_descriptor_set();
 
     // Pipelines
     external_forces_ = create_compute_pipeline(METARAL_SHADER_DIR "/fluid_external_forces.spv");
@@ -385,23 +429,14 @@ void FluidComputeContext::step(VkCommandBuffer cmd,
         return;
     }
 
+    // Ensure descriptors still point at valid buffers (defensive against any prior reinit).
+    refresh_descriptor_set();
+
     const uint32_t group_count = (count + 255u) / 256u;
     const uint32_t padded = (last_padded_ > 0) ? last_padded_ : count;
     const uint32_t sort_group_count = (padded + 255u) / 256u;
 
-    struct Push {
-        float deltaTime;
-        float smoothingRadius;
-        float targetDensity;
-        float pressureMultiplier;
-        float nearPressureMultiplier;
-        float viscosityStrength;
-        float gravity;
-        uint32_t numParticles;
-        uint32_t aux0;
-        uint32_t aux1;
-        uint32_t aux2;
-    } push;
+    FluidPushConstants push{};
 
     push.deltaTime = dt;
     push.smoothingRadius = params.smoothing_radius;
@@ -416,12 +451,12 @@ void FluidComputeContext::step(VkCommandBuffer cmd,
     push.aux2 = 0;
     last_smoothing_radius_ = params.smoothing_radius;
 
-    auto bind_and_dispatch = [&](VkPipeline pipeline, uint32_t groups, const Push& p) {
+    auto bind_and_dispatch = [&](VkPipeline pipeline, uint32_t groups, const FluidPushConstants& p) {
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
                                 pipeline_layout_, 0, 1, &descriptor_set_, 0, nullptr);
         vkCmdPushConstants(cmd, pipeline_layout_, VK_SHADER_STAGE_COMPUTE_BIT,
-                           0, sizeof(Push), &p);
+                           0, sizeof(FluidPushConstants), &p);
         vkCmdDispatch(cmd, groups, 1, 1);
     };
 
@@ -458,30 +493,36 @@ void FluidComputeContext::step(VkCommandBuffer cmd,
     barrier_buffers({keys_, indices_});
 
     // Bitonic sort across padded length
-    Push sort_push = push;
+    FluidPushConstants sort_push = push;
     sort_push.numParticles = padded;
     for (uint32_t stage = 2; stage <= padded; stage <<= 1) {
         for (uint32_t pass = stage >> 1; pass > 0; pass >>= 1) {
             sort_push.aux0 = pass;
             sort_push.aux1 = stage;
             bind_and_dispatch(bitonic_sort_, sort_group_count, sort_push);
+            // keys_/indices_ written each pass and read by the next pass
+            barrier_buffers({keys_, indices_});
         }
     }
+    // Final sort results visible to downstream passes
     barrier_buffers({keys_, indices_});
 
     // Mark range starts/ends using sorted keys
     bind_and_dispatch(range_mark_, group_count, push);
+    barrier_buffers({range_starts_, range_ends_});
 
     // Forward scan to propagate starts
-    Push scan_push = push;
+    FluidPushConstants scan_push = push;
     for (uint32_t offset = 1; offset < count; offset <<= 1) {
         scan_push.aux0 = offset;
         bind_and_dispatch(range_scan_fwd_, group_count, scan_push);
+        barrier_buffers({range_starts_});
     }
     // Backward scan to propagate ends
     for (uint32_t offset = 1; offset < count; offset <<= 1) {
         scan_push.aux0 = offset;
         bind_and_dispatch(range_scan_bwd_, group_count, scan_push);
+        barrier_buffers({range_ends_});
     }
     barrier_buffers({range_starts_, range_ends_});
 
@@ -490,6 +531,20 @@ void FluidComputeContext::step(VkCommandBuffer cmd,
     barrier_buffers({positions_a_});
 
     // Copy sorted positions back to positions_out buffer (binding 1) for downstream kernels
+    VkBufferMemoryBarrier copy_src_barrier{};
+    copy_src_barrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+    copy_src_barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    copy_src_barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    copy_src_barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    copy_src_barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    copy_src_barrier.buffer = positions_a_;
+    copy_src_barrier.offset = 0;
+    copy_src_barrier.size = VK_WHOLE_SIZE;
+    vkCmdPipelineBarrier(cmd,
+                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         0, 0, nullptr, 1, &copy_src_barrier, 0, nullptr);
+
     VkBufferCopy copy{};
     copy.srcOffset = 0;
     copy.dstOffset = 0;
@@ -512,8 +567,11 @@ void FluidComputeContext::step(VkCommandBuffer cmd,
 
     // Density / pressure / viscosity / integrate on sorted buffer
     bind_and_dispatch(density_, group_count, push);
+    barrier_buffers({densities_});
     bind_and_dispatch(pressure_, group_count, push);
+    barrier_buffers({positions_b_});
     bind_and_dispatch(viscosity_, group_count, push);
+    barrier_buffers({positions_b_});
     bind_and_dispatch(integrate_, group_count, push);
 }
 
