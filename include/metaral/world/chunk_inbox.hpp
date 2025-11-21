@@ -1,6 +1,7 @@
 #pragma once
 
 #include "metaral/world/chunk.hpp"
+#include "metaral/world/world.hpp"
 
 #include <deque>
 #include <mutex>

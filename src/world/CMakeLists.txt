@@ -3,6 +3,7 @@ add_library(metaral_world
     terrain.cpp
     edit.cpp
     chunk_store.cpp
+    chunk_streamer.cpp
     chunk_provider.cpp
 )
 
