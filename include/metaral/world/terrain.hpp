@@ -3,6 +3,7 @@
 #include "metaral/core/coords.hpp"
 #include "metaral/world/world.hpp"
 #include "metaral/world/chunk_inbox.hpp"
+#include "metaral/world/chunk_provider.hpp"
 
 #include <cstddef>
 #include <thread>
@@ -30,6 +31,14 @@ void generate_region(World& world,
                      MaterialId empty_material = 0,
                      std::size_t worker_count = std::thread::hardware_concurrency(),
                      ChunkInbox* inbox = nullptr);
+
+// Generate using a provider (cache + generator) for each chunk.
+void generate_region_with_provider(World& world,
+                                   IChunkProvider& provider,
+                                   const core::ChunkCoord& min_chunk,
+                                   const core::ChunkCoord& max_chunk,
+                                   std::size_t worker_count = std::thread::hardware_concurrency(),
+                                   ChunkInbox* inbox = nullptr);
 
 // Simple planet generator that writes voxel materials into a World using the
 // analytic terrain field.

@@ -150,4 +150,68 @@ void generate_planet(World& world,
     generate_region(world, min_chunk, max_chunk, cfg, solid_material, empty_material);
 }
 
+void generate_region_with_provider(World& world,
+                                   IChunkProvider& provider,
+                                   const core::ChunkCoord& min_chunk,
+                                   const core::ChunkCoord& max_chunk,
+                                   std::size_t worker_count,
+                                   ChunkInbox* inbox)
+{
+    std::vector<core::ChunkCoord> coords;
+    coords.reserve(static_cast<std::size_t>(max_chunk.x - min_chunk.x + 1) *
+                   static_cast<std::size_t>(max_chunk.y - min_chunk.y + 1) *
+                   static_cast<std::size_t>(max_chunk.z - min_chunk.z + 1));
+
+    for (int cx = min_chunk.x; cx <= max_chunk.x; ++cx) {
+        for (int cy = min_chunk.y; cy <= max_chunk.y; ++cy) {
+            for (int cz = min_chunk.z; cz <= max_chunk.z; ++cz) {
+                coords.push_back(core::ChunkCoord{cx, cy, cz});
+            }
+        }
+    }
+
+    if (coords.empty()) {
+        return;
+    }
+
+    auto& pool = core::global_task_pool();
+    pool.start(worker_count);
+    worker_count = pool.worker_count();
+    if (worker_count > coords.size()) {
+        worker_count = coords.size();
+    }
+
+    const bool use_inbox = inbox != nullptr;
+    std::vector<ChunkData> results;
+    if (!use_inbox) {
+        results.resize(coords.size());
+    }
+
+    std::cout << "[terrain] generate_region_with_provider: "
+              << coords.size() << " chunk(s) on " << worker_count
+              << " worker(s)\n";
+
+    std::latch done(static_cast<std::ptrdiff_t>(coords.size()));
+
+    for (std::size_t idx = 0; idx < coords.size(); ++idx) {
+        pool.submit([&, idx](std::stop_token) {
+            ChunkData chunk = provider.get(coords[idx]);
+            if (use_inbox) {
+                inbox->push(std::move(chunk));
+            } else {
+                results[idx] = std::move(chunk);
+            }
+            done.count_down();
+        });
+    }
+
+    done.wait();
+
+    if (!use_inbox) {
+        for (auto& chunk : results) {
+            world.adopt_chunk(std::move(chunk));
+        }
+    }
+}
+
 } // namespace metaral::world::terrain
