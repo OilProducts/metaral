@@ -6,6 +6,23 @@ It’s the tech stack behind the game **Metaral: Neventinue**, where the first s
 
 ---
 
+## Build note (Linux/Wayland)
+
+If SDL3 fails to configure with “could not find X11 or Wayland development libraries”, the smallest Wayland set on Debian/Ubuntu is:
+
+```bash
+sudo apt install libwayland-dev libxkbcommon-dev libdrm-dev libgbm-dev libegl1-mesa-dev
+```
+
+Vulkan targets are enabled by default; install the headers/loader plus `glslc` (Shaderc) for shader compilation:
+
+```bash
+sudo apt install libvulkan-dev shaderc
+```
+```>***
+
+---
+
 ## High-Level Module Breakdown
 
 The repository is organized around a clear separation of concerns between **core types**, **world representation**, **simulation**, and **rendering**, plus tooling and platform glue.

@@ -26,10 +26,7 @@ if(METARAL_ENABLE_VULKAN)
         GIT_SHALLOW TRUE
     )
 
-    FetchContent_GetProperties(imgui)
-    if(NOT imgui_POPULATED)
-        FetchContent_Populate(imgui)
-    endif()
+    FetchContent_MakeAvailable(imgui)
 
     set(METARAL_IMGUI_BACKEND_SRC "${PROJECT_SOURCE_DIR}/third_party/imgui/imgui_impl_sdl3.cpp")
     if(EXISTS "${METARAL_IMGUI_BACKEND_SRC}")
