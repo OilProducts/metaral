@@ -12,7 +12,9 @@ void main() {
 
     Particle p = positions_in.particles[i];
     vec3 vel = p.velocity.xyz;
-    vel.y += params.gravity * params.deltaTime;
+    float r = length(p.position.xyz);
+    vec3 radial_up = (r > 1e-4) ? (p.position.xyz / r) : vec3(0.0, 1.0, 0.0);
+    vel += radial_up * params.gravity * params.deltaTime;
 
     vec3 pos = p.position.xyz + vel * params.deltaTime;
 

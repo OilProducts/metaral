@@ -1,0 +1,30 @@
+// Exclusive prefix sum over 256 bucket counts; writes offsets and clears counts.
+#version 450
+#include "fluid_common.glsl"
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+shared uint prefix[256];
+
+void main() {
+    uint i = gl_LocalInvocationID.x;
+    uint c = counts[i];
+    prefix[i] = c;
+    barrier();
+
+    // Inclusive scan in shared memory.
+    for (uint stride = 1u; stride < 256u; stride <<= 1u) {
+        uint val = 0u;
+        if (i >= stride) {
+            val = prefix[i - stride];
+        }
+        barrier();
+        prefix[i] += val;
+        barrier();
+    }
+
+    // Exclusive offset: shift right by one, first bucket is 0.
+    uint exclusive = (i == 0u) ? 0u : prefix[i - 1u];
+    offsets[i] = exclusive;
+    counts[i] = 0u; // reset for use as atomic counter in scatter
+}

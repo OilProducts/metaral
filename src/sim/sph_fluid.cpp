@@ -45,7 +45,9 @@ void FluidSim::clear() {
 
 void FluidSim::integrate(float dt) {
     for (auto& p : particles_) {
-        p.velocity.y += params_.gravity * dt;
+        // Pull toward/away from the planet center so collisions match the spherical boundary.
+        const core::PlanetPosition radial_up = core::surface_normal(p.position);
+        p.velocity = p.velocity + radial_up * (params_.gravity * dt);
         p.position = p.position + p.velocity * dt;
     }
 }

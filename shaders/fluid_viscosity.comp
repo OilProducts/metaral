@@ -7,6 +7,49 @@ layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 layout(std430, binding = 5) buffer RangeStarts { uint starts[]; };
 layout(std430, binding = 6) buffer RangeEnds   { uint ends[]; };
 
+layout(std430, binding = 2) buffer HashKeys {
+    uint keys[];
+};
+
+uint hash(uvec3 v) {
+    v = (v + 0x7ed55d16u) + (v << 12u);
+    v = (v ^ 0xc761c23cu) ^ (v >> 19u);
+    v = (v + 0x165667b1u) + (v << 5u);
+    v = (v + 0xd3a2646cu) ^ (v << 9u);
+    v = (v + 0xfd7046c5u) + (v << 3u);
+    v = (v ^ 0xb55a4f09u) ^ (v >> 16u);
+    return v.x ^ v.y ^ v.z;
+}
+
+bool find_range_for_key(uint key, out uint start, out uint end) {
+    uint lo = 0u;
+    uint hi = params.numParticles;
+    while (lo < hi) {
+        uint mid = (lo + hi) >> 1;
+        uint k = keys[mid];
+        if (k < key) {
+            lo = mid + 1u;
+        } else {
+            hi = mid;
+        }
+    }
+    if (lo >= params.numParticles || keys[lo] != key) {
+        return false;
+    }
+    start = lo;
+    hi = params.numParticles;
+    while (lo < hi) {
+        uint mid = (lo + hi) >> 1;
+        if (keys[mid] > key) {
+            hi = mid;
+        } else {
+            lo = mid + 1u;
+        }
+    }
+    end = hi;
+    return true;
+}
+
 void main() {
     if (params.viscosityStrength <= 0.0) {
         return;
@@ -20,16 +63,30 @@ void main() {
     vec3 pi = positions_out.particles[i].position.xyz;
     vec3 vi = positions_out.particles[i].velocity.xyz;
     float h = params.smoothingRadius;
+    ivec3 cell = ivec3(floor(pi / h));
 
-    for (uint j = start; j < end; ++j) {
-        if (j == uint(i)) continue;
-        vec3 pj = positions_out.particles[j].position.xyz;
-        vec3 vj = positions_out.particles[j].velocity.xyz;
-        float r = length(pi - pj);
-        if (r >= h) continue;
-        float q = r / h;
-        float w = (1.0 - q);
-        vi += params.viscosityStrength * w * (vj - vi) * params.deltaTime;
+    for (int dz = -1; dz <= 1; ++dz) {
+        for (int dy = -1; dy <= 1; ++dy) {
+            for (int dx = -1; dx <= 1; ++dx) {
+                uvec3 neighbor = uvec3(cell + ivec3(dx, dy, dz));
+                uint key = hash(neighbor);
+                uint nStart = 0u;
+                uint nEnd = 0u;
+                if (!find_range_for_key(key, nStart, nEnd)) {
+                    continue;
+                }
+                for (uint j = nStart; j < nEnd; ++j) {
+                    if (j == uint(i)) continue;
+                    vec3 pj = positions_out.particles[j].position.xyz;
+                    vec3 vj = positions_out.particles[j].velocity.xyz;
+                    float r = length(pi - pj);
+                    if (r >= h) continue;
+                    float q = r / h;
+                    float w = (1.0 - q);
+                    vi += params.viscosityStrength * w * (vj - vi) * params.deltaTime;
+                }
+            }
+        }
     }
 
     positions_out.particles[i].velocity = vec4(vi, 0.0);

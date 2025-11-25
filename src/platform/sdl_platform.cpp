@@ -75,9 +75,15 @@ bool SdlPlatform::poll_event(Event& out_event) {
         switch (event.type) {
         case SDL_EVENT_QUIT:
             out_event.type = EventType::Quit;
+#if METARAL_HAS_SDL3
+            out_event.raw_sdl = event;
+#endif
             return true;
         case SDL_EVENT_WINDOW_RESIZED:
             out_event.type = EventType::WindowResized;
+#if METARAL_HAS_SDL3
+            out_event.raw_sdl = event;
+#endif
             out_event.window_resized.width = event.window.data1;
             out_event.window_resized.height = event.window.data2;
             impl_->config.width = event.window.data1;
@@ -85,28 +91,43 @@ bool SdlPlatform::poll_event(Event& out_event) {
             return true;
         case SDL_EVENT_KEY_DOWN:
             out_event.type = EventType::KeyDown;
+#if METARAL_HAS_SDL3
+            out_event.raw_sdl = event;
+#endif
             out_event.key.keycode = event.key.key;
             out_event.key.scancode = event.key.scancode;
             out_event.key.repeat = event.key.repeat != 0;
             return true;
         case SDL_EVENT_KEY_UP:
             out_event.type = EventType::KeyUp;
+#if METARAL_HAS_SDL3
+            out_event.raw_sdl = event;
+#endif
             out_event.key.keycode = event.key.key;
             out_event.key.scancode = event.key.scancode;
             out_event.key.repeat = false;
             return true;
         case SDL_EVENT_MOUSE_MOTION:
             out_event.type = EventType::MouseMotion;
+#if METARAL_HAS_SDL3
+            out_event.raw_sdl = event;
+#endif
             out_event.mouse_motion.dx = event.motion.xrel;
             out_event.mouse_motion.dy = event.motion.yrel;
             return true;
         case SDL_EVENT_MOUSE_BUTTON_DOWN:
             out_event.type = EventType::MouseButtonDown;
+#if METARAL_HAS_SDL3
+            out_event.raw_sdl = event;
+#endif
             out_event.mouse_button.button = event.button.button;
             out_event.mouse_button.pressed = true;
             return true;
         case SDL_EVENT_MOUSE_BUTTON_UP:
             out_event.type = EventType::MouseButtonUp;
+#if METARAL_HAS_SDL3
+            out_event.raw_sdl = event;
+#endif
             out_event.mouse_button.button = event.button.button;
             out_event.mouse_button.pressed = false;
             return true;
@@ -413,6 +434,9 @@ int run_app(IApp& app, const WindowConfig& cfg) {
 
         Event event;
         while (platform.poll_event(event)) {
+#if METARAL_HAS_SDL3
+            app.on_sdl_event(event.raw_sdl);
+#endif
             handle_event(event, state);
         }
 

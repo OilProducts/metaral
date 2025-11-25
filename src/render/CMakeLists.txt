@@ -28,9 +28,12 @@ if(METARAL_ENABLE_VULKAN)
     # Fluid compute shaders (SPH-inspired pipeline)
     set(METARAL_FLUID_SHADERS
         ${METARAL_SHADER_DIR}/fluid_common.glsl
+        ${METARAL_SHADER_DIR}/sdf_octree.glsl
         ${METARAL_SHADER_DIR}/fluid_external_forces.comp
         ${METARAL_SHADER_DIR}/fluid_spatial_hash.comp
-        ${METARAL_SHADER_DIR}/fluid_bitonic_sort.comp
+        ${METARAL_SHADER_DIR}/fluid_bucket_count.comp
+        ${METARAL_SHADER_DIR}/fluid_bucket_prefix.comp
+        ${METARAL_SHADER_DIR}/fluid_radix_scatter.comp
         ${METARAL_SHADER_DIR}/fluid_reorder.comp
         ${METARAL_SHADER_DIR}/fluid_density.comp
         ${METARAL_SHADER_DIR}/fluid_pressure.comp
@@ -39,6 +42,8 @@ if(METARAL_ENABLE_VULKAN)
         ${METARAL_SHADER_DIR}/fluid_range_mark.comp
         ${METARAL_SHADER_DIR}/fluid_range_scan_forward.comp
         ${METARAL_SHADER_DIR}/fluid_range_scan_backward.comp
+        ${METARAL_SHADER_DIR}/fluid_clear_volume.comp
+        ${METARAL_SHADER_DIR}/fluid_splat_volume.comp
     )
 
     set(METARAL_VERT_SPV "${CMAKE_BINARY_DIR}/shaders/fullscreen_triangle.vert.spv")
@@ -64,8 +69,8 @@ if(METARAL_ENABLE_VULKAN)
     set(METARAL_FLUID_SPV)
     foreach(SRC ${METARAL_FLUID_SHADERS})
         get_filename_component(NAME_WE ${SRC} NAME_WE)
-        # Skip the shared include file; no SPIR-V output needed.
-        if(NAME_WE STREQUAL "fluid_common")
+        # Skip shared include files; no SPIR-V output needed.
+        if(NAME_WE STREQUAL "fluid_common" OR NAME_WE STREQUAL "sdf_octree")
             continue()
         endif()
         set(OUT_SPV "${CMAKE_BINARY_DIR}/shaders/${NAME_WE}.spv")
@@ -73,7 +78,7 @@ if(METARAL_ENABLE_VULKAN)
             OUTPUT ${OUT_SPV}
             COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/shaders"
             COMMAND glslc -I${METARAL_SHADER_DIR} ${SRC} -o ${OUT_SPV}
-            DEPENDS ${SRC} ${METARAL_SHADER_DIR}/fluid_common.glsl
+            DEPENDS ${SRC} ${METARAL_SHADER_DIR}/fluid_common.glsl ${METARAL_SHADER_DIR}/sdf_octree.glsl
             VERBATIM
         )
         list(APPEND METARAL_FLUID_SPV ${OUT_SPV})

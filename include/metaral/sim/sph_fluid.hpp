@@ -16,7 +16,7 @@
 namespace metaral::sim {
 
 struct SphParams {
-    float gravity = -10.0f;            // m/s^2, applied along +Y up axis
+    float gravity = -10.0f;            // m/s^2, applied along radial-up from planet center
     float smoothing_radius = 0.2f;     // kernel radius (meters)
     float target_density = 630.0f;     // rest density (kg/m^3)
     float pressure_multiplier = 288.0f;

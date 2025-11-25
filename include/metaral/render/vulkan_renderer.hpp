@@ -51,7 +51,7 @@ public:
     VulkanRenderer& operator=(const VulkanRenderer&) = delete;
 
     void resize(std::uint32_t width, std::uint32_t height);
-    void draw_frame(const Camera& camera, const world::World& world);
+    void draw_frame(const Camera& camera, const world::World& world, float dt_seconds);
     void wait_idle();
 
     // Mark the SDF grid as dirty in a given world-space region; the grid will

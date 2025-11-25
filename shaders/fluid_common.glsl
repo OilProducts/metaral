@@ -12,6 +12,18 @@ layout(std430, binding = 1) buffer PositionsOut {
     Particle particles[];
 } positions_out;
 
+layout(std430, binding = 11) buffer BucketOffsets {
+    uint offsets[];
+};
+
+layout(std430, binding = 12) buffer BucketCounts {
+    uint counts[];
+};
+
+layout(std430, binding = 13) buffer SortedIndices {
+    uint sortedIndices[];
+};
+
 layout(push_constant) uniform FluidPush {
     float deltaTime;
     float smoothingRadius;
@@ -25,6 +37,18 @@ layout(push_constant) uniform FluidPush {
     uint  aux1;
     uint  aux2;
 } params;
+
+layout(std140, binding = 9) uniform FluidParams {
+    vec4 volumeOriginCell; // xyz = world-space min corner, w = cell size
+    vec4 volumeDimIso;     // xyz = dimensions (float), w = iso threshold
+    vec4 planetParams;     // x = planet radius, y = collision damping, z/w unused
+    vec4 sdfParams;        // x = sdf dim, y = voxel size, z = half extent, w = planet radius fallback
+    vec4 octreeParams;     // x = node count, y = root index, z = max depth, w = enabled flag (>0)
+} uFluid;
+
+layout(std430, binding = 10) readonly buffer SdfValues {
+    float values[];
+} uSdf;
 
 // Convenience: clamp thread id to particle count and return -1 if out.
 int particleIndex() {

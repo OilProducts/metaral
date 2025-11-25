@@ -194,6 +194,7 @@ enum class MovementMode {
 class VulkanViewer final : public metaral::platform::IApp {
 public:
     void on_init(const metaral::platform::AppInitContext& ctx) override;
+    void on_sdl_event(const SDL_Event& ev) override;
     void on_frame(const metaral::platform::FrameContext& ctx) override;
     void on_shutdown() override;
 
@@ -302,6 +303,12 @@ void VulkanViewer::on_init(const metaral::platform::AppInitContext& ctx) {
     }
 }
 
+void VulkanViewer::on_sdl_event(const SDL_Event& ev) {
+    if (imgui_initialized_) {
+        ImGui_ImplSDL3_ProcessEvent(&ev);
+    }
+}
+
 void VulkanViewer::on_frame(const metaral::platform::FrameContext& ctx) {
     if (ctx.input.key_escape || ctx.input.quit_requested) {
         ctx.request_quit();
@@ -334,19 +341,23 @@ void VulkanViewer::on_frame(const metaral::platform::FrameContext& ctx) {
     const float mouse_sensitivity = 0.0025f;
     const float max_free_pitch = 1.3f;  // ~75 degrees
     const float max_walk_pitch = 0.6f;  // ~35 degrees
+    const bool ui_captures_mouse =
+        imgui_initialized_ && ImGui::GetCurrentContext() && ImGui::GetIO().WantCaptureMouse;
+    const bool ui_captures_keyboard =
+        imgui_initialized_ && ImGui::GetCurrentContext() && ImGui::GetIO().WantCaptureKeyboard;
 
     PlanetPosition radial_up = safe_radial_up(camera_.position);
 
     // Tool/brush input (no editing yet).
-    if (ctx.input.key_1_pressed) {
+    if (!ui_captures_keyboard && ctx.input.key_1_pressed) {
         current_mode_ = metaral::world::EditMode::Dig;
         std::cout << "Edit mode: Dig\n";
     }
-    if (ctx.input.key_2_pressed) {
+    if (!ui_captures_keyboard && ctx.input.key_2_pressed) {
         current_mode_ = metaral::world::EditMode::Fill;
         std::cout << "Edit mode: Fill\n";
     }
-    if (ctx.input.key_3_pressed) {
+    if (!ui_captures_keyboard && ctx.input.key_3_pressed) {
         current_mode_ = metaral::world::EditMode::Paint;
         std::cout << "Edit mode: Paint\n";
     }
@@ -355,17 +366,17 @@ void VulkanViewer::on_frame(const metaral::platform::FrameContext& ctx) {
     constexpr float kMaxBrushRadius = 20.0f;
     constexpr float kBrushStep = 0.5f;
 
-    if (ctx.input.key_period_pressed) {
+    if (!ui_captures_keyboard && ctx.input.key_period_pressed) {
         brush_.radius_m = std::min(kMaxBrushRadius, brush_.radius_m + kBrushStep);
         std::cout << "Brush radius increased to " << brush_.radius_m << " m\n";
     }
-    if (ctx.input.key_comma_pressed) {
+    if (!ui_captures_keyboard && ctx.input.key_comma_pressed) {
         brush_.radius_m = std::max(kMinBrushRadius, brush_.radius_m - kBrushStep);
         std::cout << "Brush radius decreased to " << brush_.radius_m << " m\n";
     }
 
     // Cycle through a small set of demo material IDs: 1,2,3,...
-    if (ctx.input.key_bracket_right_pressed) {
+    if (!ui_captures_keyboard && ctx.input.key_bracket_right_pressed) {
         if (brush_.material == 0) {
             brush_.material = 1;
         } else {
@@ -373,7 +384,7 @@ void VulkanViewer::on_frame(const metaral::platform::FrameContext& ctx) {
         }
         std::cout << "Brush material increased to " << brush_.material << "\n";
     }
-    if (ctx.input.key_bracket_left_pressed) {
+    if (!ui_captures_keyboard && ctx.input.key_bracket_left_pressed) {
         if (brush_.material > 1) {
             brush_.material = static_cast<metaral::world::MaterialId>(brush_.material - 1);
         }
@@ -381,13 +392,13 @@ void VulkanViewer::on_frame(const metaral::platform::FrameContext& ctx) {
     }
 
     // Toggle fluid simulation on/off with 'F'
-    if (ctx.input.key_f_pressed && fluid_) {
+    if (!ui_captures_keyboard && ctx.input.key_f_pressed && fluid_) {
         fluid_enabled_ = !fluid_enabled_;
         if (fluid_enabled_) {
             // Spawn a small blob in front of the camera.
             const PlanetPosition spawn_center = add(camera_.position, scale(normalized(camera_.forward), 10.0f));
             const float spawn_radius = 3.0f;
-            const std::size_t spawn_count = 4000;
+            const std::size_t spawn_count = 40000; // 10x more particles
             fluid_->clear_particles();
             fluid_->spawn_sphere(spawn_center, spawn_radius, spawn_count);
             renderer_->fluid_params() = fluid_->params();
@@ -411,7 +422,7 @@ void VulkanViewer::on_frame(const metaral::platform::FrameContext& ctx) {
     // continuous editing does not apply hundreds of brush operations per
     // second. Currently limited to once every 0.1 seconds.
     constexpr float kBrushCooldownSeconds = 0.1f; // 100 ms
-    if (ctx.input.mouse_left_button && renderer_ && brush_cooldown_s_ <= 0.0f) {
+    if (!ui_captures_mouse && ctx.input.mouse_left_button && renderer_ && brush_cooldown_s_ <= 0.0f) {
         const metaral::render::SdfGrid* grid = renderer_->sdf_grid();
         if (grid) {
             constexpr float kMaxDist = 1000.0f;
@@ -614,7 +625,7 @@ void VulkanViewer::on_frame(const metaral::platform::FrameContext& ctx) {
         }
     }
 
-    if (ctx.input.mouse_right_button) {
+    if (ctx.input.mouse_right_button && !ui_captures_mouse) {
         const float yaw_delta = ctx.input.mouse_delta_x * mouse_sensitivity;
         const float pitch_delta = ctx.input.mouse_delta_y * mouse_sensitivity;
         if (mode_ == MovementMode::Walkabout) {
@@ -760,7 +771,7 @@ void VulkanViewer::on_frame(const metaral::platform::FrameContext& ctx) {
         }
     }
 
-    renderer_->draw_frame(camera_, *world_);
+    renderer_->draw_frame(camera_, *world_, dt);
 }
 
 void VulkanViewer::on_shutdown() {

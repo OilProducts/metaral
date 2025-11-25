@@ -25,7 +25,8 @@ constexpr float kSdfVoxelSizeMeters = .5f;
 constexpr float kSdfMarginVoxels = 40.0f;
 // Width of the band (in cells) around the surface within which we smooth
 // the signed-distance field. Keeps far-field distances unchanged.
-constexpr float kSdfSmoothBandCells = 4.0f;
+constexpr float kSdfSmoothBandCells = 6.0f;
+constexpr int   kSdfSmoothPasses = 2;
 
 // Octree configuration. These values are intentionally conservative and can be
 // tuned once the basic traversal is in place.
@@ -308,10 +309,9 @@ void compute_edt_3d(const std::vector<std::uint8_t>& occupancy,
     });
 }
 
-// Simple 3x3x3 box blur applied to the SDF values near the surface. This
-// operates in-place on the grid's values, leaving far-field distances
-// unchanged to avoid unnecessary work and to keep the analytic fallback
-// behavior consistent.
+// Separable 1-2-1 Gaussian blur applied near the surface. Two passes of
+// X/Y/Z smoothing soften voxel-oriented artifacts without pushing the far
+// field away from the analytic fallback.
 void smooth_sdf_full(SdfGrid& grid)
 {
     const std::uint32_t dim = grid.dim;
@@ -330,64 +330,72 @@ void smooth_sdf_full(SdfGrid& grid)
         return;
     }
 
-    const auto& src = grid.values;
+    std::vector<float> src = grid.values;
+    std::vector<float> tmp(cell_count, 0.0f);
     std::vector<float> dst(cell_count, 0.0f);
 
-    const int dim_i = static_cast<int>(dim);
+    const auto smooth_axis = [&](const std::vector<float>& in,
+                                 std::vector<float>& out,
+                                 int axis) {
+        for (std::uint32_t z = 0; z < dim; ++z) {
+            for (std::uint32_t y = 0; y < dim; ++y) {
+                for (std::uint32_t x = 0; x < dim; ++x) {
+                    const std::size_t idx =
+                        linear_index(dim, x, y, z);
+                    const float center = in[idx];
 
-    for (std::uint32_t z = 0; z < dim; ++z) {
-        for (std::uint32_t y = 0; y < dim; ++y) {
-            for (std::uint32_t x = 0; x < dim; ++x) {
-                const std::size_t idx_center =
-                    linear_index(dim, x, y, z);
-
-                const float center = src[idx_center];
-                if (std::fabs(center) > band_meters) {
-                    // Outside the smoothing band: keep the original distance.
-                    dst[idx_center] = center;
-                    continue;
-                }
-
-                float sum = 0.0f;
-                int count = 0;
-
-                for (int dz = -1; dz <= 1; ++dz) {
-                    const int zz = static_cast<int>(z) + dz;
-                    if (zz < 0 || zz >= dim_i) {
+                    if (std::fabs(center) > band_meters) {
+                        out[idx] = center;
                         continue;
                     }
-                    for (int dy = -1; dy <= 1; ++dy) {
-                        const int yy = static_cast<int>(y) + dy;
-                        if (yy < 0 || yy >= dim_i) {
-                            continue;
-                        }
-                        for (int dx = -1; dx <= 1; ++dx) {
-                            const int xx = static_cast<int>(x) + dx;
-                            if (xx < 0 || xx >= dim_i) {
-                                continue;
-                            }
 
-                            const std::size_t nidx = linear_index(
-                                dim,
-                                static_cast<std::uint32_t>(xx),
-                                static_cast<std::uint32_t>(yy),
-                                static_cast<std::uint32_t>(zz));
-                            sum += src[nidx];
-                            ++count;
+                    float weighted = center * 2.0f; // center weight
+                    float weight_sum = 2.0f;
+
+                    const auto add_neighbor =
+                        [&](std::uint32_t nx,
+                            std::uint32_t ny,
+                            std::uint32_t nz) {
+                            weighted += in[linear_index(dim, nx, ny, nz)];
+                            weight_sum += 1.0f;
+                        };
+
+                    if (axis == 0) { // X
+                        if (x > 0) {
+                            add_neighbor(x - 1, y, z);
+                        }
+                        if (x + 1 < dim) {
+                            add_neighbor(x + 1, y, z);
+                        }
+                    } else if (axis == 1) { // Y
+                        if (y > 0) {
+                            add_neighbor(x, y - 1, z);
+                        }
+                        if (y + 1 < dim) {
+                            add_neighbor(x, y + 1, z);
+                        }
+                    } else { // Z
+                        if (z > 0) {
+                            add_neighbor(x, y, z - 1);
+                        }
+                        if (z + 1 < dim) {
+                            add_neighbor(x, y, z + 1);
                         }
                     }
-                }
 
-                if (count > 0) {
-                    dst[idx_center] = sum / static_cast<float>(count);
-                } else {
-                    dst[idx_center] = center;
+                    out[idx] = weighted / weight_sum;
                 }
             }
         }
+    };
+
+    for (int pass = 0; pass < kSdfSmoothPasses; ++pass) {
+        smooth_axis(src, tmp, 0);
+        smooth_axis(tmp, dst, 1);
+        smooth_axis(dst, src, 2);
     }
 
-    grid.values.swap(dst);
+    grid.values.swap(src);
 }
 
 // Build a conservative, multi-level octree over the existing SDF grid. The
@@ -838,6 +846,310 @@ void build_sdf_grid_from_world(const world::World& world,
     const auto octree_start = std::chrono::steady_clock::now();
     build_sdf_octree_full(out, out);
     log_ms("octree build", octree_start, std::chrono::steady_clock::now());
+}
+
+// Incrementally refresh the octree hierarchy for a dirty region of the dense
+// grid. Leaves overlapping the region are recomputed from the dense SDF, and
+// parent nodes are updated bottom-up; structure/layout remain unchanged.
+void update_octree_region_from_grid(SdfGrid& grid,
+                                    int ix_min,
+                                    int iy_min,
+                                    int iz_min,
+                                    int ix_max,
+                                    int iy_max,
+                                    int iz_max)
+{
+    if (!grid.has_octree || grid.octree.empty()) {
+        return;
+    }
+
+    const std::uint32_t depth = grid.octree.depth;
+    if (depth == 0 ||
+        grid.octree.level_offsets.size() < depth ||
+        grid.octree.nodes.empty()) {
+        return;
+    }
+
+    // Reconstruct level dimensions from offsets; nodes are stored densely per level.
+    std::vector<std::uint32_t> level_dims(depth, 0);
+    for (std::uint32_t level = 0; level < depth; ++level) {
+        const std::size_t begin = grid.octree.level_offsets[level];
+        const std::size_t end = (level + 1 < depth)
+                                    ? grid.octree.level_offsets[level + 1]
+                                    : grid.octree.nodes.size();
+        if (end <= begin) {
+            return;
+        }
+        const std::size_t count = end - begin;
+        const double dim_d = std::cbrt(static_cast<double>(count));
+        const std::uint32_t dim_i = static_cast<std::uint32_t>(std::lround(dim_d));
+        if (dim_i == 0 || static_cast<std::size_t>(dim_i) * dim_i * dim_i != count) {
+            return; // layout unexpected; bail out
+        }
+        level_dims[level] = dim_i;
+    }
+
+    const std::uint32_t leaf_dim = level_dims[0];
+    const std::uint32_t block = kSdfOctreeLeafBlockDim;
+    const int lx_min = std::max(0, ix_min / static_cast<int>(block));
+    const int ly_min = std::max(0, iy_min / static_cast<int>(block));
+    const int lz_min = std::max(0, iz_min / static_cast<int>(block));
+    const int lx_max = std::min(static_cast<int>(leaf_dim) - 1,
+                                ix_max / static_cast<int>(block));
+    const int ly_max = std::min(static_cast<int>(leaf_dim) - 1,
+                                iy_max / static_cast<int>(block));
+    const int lz_max = std::min(static_cast<int>(leaf_dim) - 1,
+                                iz_max / static_cast<int>(block));
+
+    if (lx_max < lx_min || ly_max < ly_min || lz_max < lz_min) {
+        return;
+    }
+
+    const float voxel_size = grid.voxel_size;
+    const float grid_min = -grid.half_extent;
+    const std::uint32_t dim = grid.dim;
+
+    auto recompute_leaf = [&](std::uint32_t lx, std::uint32_t ly, std::uint32_t lz) {
+        const std::uint32_t base_x = lx * block;
+        const std::uint32_t base_y = ly * block;
+        const std::uint32_t base_z = lz * block;
+        const std::uint32_t max_x = std::min(base_x + block, dim);
+        const std::uint32_t max_y = std::min(base_y + block, dim);
+        const std::uint32_t max_z = std::min(base_z + block, dim);
+
+        bool any_solid = false;
+        bool any_empty = false;
+        float min_abs_dist = std::numeric_limits<float>::infinity();
+        float max_abs_dist = 0.0f;
+
+        for (std::uint32_t zz = base_z; zz < max_z; ++zz) {
+            for (std::uint32_t yy = base_y; yy < max_y; ++yy) {
+                for (std::uint32_t xx = base_x; xx < max_x; ++xx) {
+                    const std::size_t cell_index =
+                        linear_index(dim, xx, yy, zz);
+
+                    const std::uint8_t occ =
+                        grid.occupancy[cell_index];
+                    if (occ != 0u) {
+                        any_solid = true;
+                    } else {
+                        any_empty = true;
+                    }
+
+                    const float v = grid.values[cell_index];
+                    if (std::isfinite(v)) {
+                        const float a = std::fabs(v);
+                        if (a < min_abs_dist) {
+                            min_abs_dist = a;
+                        }
+                        if (a > max_abs_dist) {
+                            max_abs_dist = a;
+                        }
+                    }
+                }
+            }
+        }
+
+        const std::size_t node_index =
+            grid.octree.level_offsets[0] +
+            linear_index(leaf_dim, lx, ly, lz);
+        SdfOctreeNode& node = grid.octree.nodes[node_index];
+
+        const float x_min = grid_min +
+            static_cast<float>(base_x) * voxel_size;
+        const float x_max = grid_min +
+            static_cast<float>(max_x) * voxel_size;
+        const float y_min = grid_min +
+            static_cast<float>(base_y) * voxel_size;
+        const float y_max = grid_min +
+            static_cast<float>(max_y) * voxel_size;
+        const float z_min = grid_min +
+            static_cast<float>(base_z) * voxel_size;
+        const float z_max = grid_min +
+            static_cast<float>(max_z) * voxel_size;
+
+        node.center.x = 0.5f * (x_min + x_max);
+        node.center.y = 0.5f * (y_min + y_max);
+        node.center.z = 0.5f * (z_min + z_max);
+        node.half_size = 0.5f * std::max(
+            std::max(x_max - x_min, y_max - y_min),
+            z_max - z_min);
+
+        node.min_distance = min_abs_dist;
+        node.max_distance = max_abs_dist;
+        node.first_child = std::numeric_limits<std::uint32_t>::max();
+
+        std::uint8_t occ_mask = 0;
+        if (any_empty) occ_mask |= kSdfOctreeNodeEmpty;
+        if (any_solid) occ_mask |= kSdfOctreeNodeSolid;
+        node.occupancy_mask = occ_mask;
+
+        std::uint8_t flags = 0;
+        if (any_empty && any_solid) {
+            flags |= kSdfOctreeNodeHasSurface;
+        }
+        node.flags = flags;
+        node.reserved = 0;
+    };
+
+    for (int lz = lz_min; lz <= lz_max; ++lz) {
+        for (int ly = ly_min; ly <= ly_max; ++ly) {
+            for (int lx = lx_min; lx <= lx_max; ++lx) {
+                recompute_leaf(static_cast<std::uint32_t>(lx),
+                               static_cast<std::uint32_t>(ly),
+                               static_cast<std::uint32_t>(lz));
+            }
+        }
+    }
+
+    // Propagate updates up the hierarchy. Track the range of nodes touched at each level.
+    int range_x_min = lx_min;
+    int range_x_max = lx_max;
+    int range_y_min = ly_min;
+    int range_y_max = ly_max;
+    int range_z_min = lz_min;
+    int range_z_max = lz_max;
+
+    for (std::uint32_t level = 1; level < depth; ++level) {
+        const std::uint32_t dim_here = level_dims[level];
+        const std::uint32_t dim_child = level_dims[level - 1];
+        const std::uint32_t offset_here = grid.octree.level_offsets[level];
+        const std::uint32_t offset_child = grid.octree.level_offsets[level - 1];
+
+        const int px_min = std::max(0, range_x_min / 2);
+        const int py_min = std::max(0, range_y_min / 2);
+        const int pz_min = std::max(0, range_z_min / 2);
+        const int px_max = std::min(static_cast<int>(dim_here) - 1, range_x_max / 2);
+        const int py_max = std::min(static_cast<int>(dim_here) - 1, range_y_max / 2);
+        const int pz_max = std::min(static_cast<int>(dim_here) - 1, range_z_max / 2);
+
+        if (px_max < px_min || py_max < py_min || pz_max < pz_min) {
+            break;
+        }
+
+        for (int z = pz_min; z <= pz_max; ++z) {
+            for (int y = py_min; y <= py_max; ++y) {
+                for (int x = px_min; x <= px_max; ++x) {
+                    const std::size_t parent_index =
+                        offset_here + linear_index(dim_here,
+                                                   static_cast<std::uint32_t>(x),
+                                                   static_cast<std::uint32_t>(y),
+                                                   static_cast<std::uint32_t>(z));
+                    SdfOctreeNode& parent = grid.octree.nodes[parent_index];
+
+                    bool any_child = false;
+                    bool any_solid = false;
+                    bool any_empty = false;
+                    bool any_surface = false;
+                    float min_abs_dist = std::numeric_limits<float>::infinity();
+                    float max_abs_dist = 0.0f;
+
+                    core::PlanetPosition bounds_min{
+                        std::numeric_limits<float>::infinity(),
+                        std::numeric_limits<float>::infinity(),
+                        std::numeric_limits<float>::infinity()};
+                    core::PlanetPosition bounds_max{
+                        -std::numeric_limits<float>::infinity(),
+                        -std::numeric_limits<float>::infinity(),
+                        -std::numeric_limits<float>::infinity()};
+
+                    const std::uint32_t child_x0 = static_cast<std::uint32_t>(x) * 2u;
+                    const std::uint32_t child_y0 = static_cast<std::uint32_t>(y) * 2u;
+                    const std::uint32_t child_z0 = static_cast<std::uint32_t>(z) * 2u;
+
+                    for (std::uint32_t dz = 0; dz < 2u; ++dz) {
+                        const std::uint32_t cz = child_z0 + dz;
+                        if (cz >= dim_child) continue;
+                        for (std::uint32_t dy = 0; dy < 2u; ++dy) {
+                            const std::uint32_t cy = child_y0 + dy;
+                            if (cy >= dim_child) continue;
+                            for (std::uint32_t dx = 0; dx < 2u; ++dx) {
+                                const std::uint32_t cx = child_x0 + dx;
+                                if (cx >= dim_child) continue;
+
+                                const std::size_t child_index =
+                                    offset_child +
+                                    linear_index(dim_child, cx, cy, cz);
+                                const SdfOctreeNode& child = grid.octree.nodes[child_index];
+
+                                any_child = true;
+                                const float child_min = child.min_distance;
+                                const float child_max = child.max_distance;
+                                if (child_min < min_abs_dist) {
+                                    min_abs_dist = child_min;
+                                }
+                                if (child_max > max_abs_dist) {
+                                    max_abs_dist = child_max;
+                                }
+
+                                const bool child_empty = (child.occupancy_mask & kSdfOctreeNodeEmpty) != 0u;
+                                const bool child_solid = (child.occupancy_mask & kSdfOctreeNodeSolid) != 0u;
+                                const bool child_surface = (child.occupancy_mask & kSdfOctreeNodeHasSurface) != 0u;
+
+                                any_empty = any_empty || child_empty;
+                                any_solid = any_solid || child_solid;
+                                any_surface = any_surface || child_surface;
+
+                                const float h = child.half_size;
+                                const core::PlanetPosition c = child.center;
+                                bounds_min.x = std::min(bounds_min.x, c.x - h);
+                                bounds_min.y = std::min(bounds_min.y, c.y - h);
+                                bounds_min.z = std::min(bounds_min.z, c.z - h);
+                                bounds_max.x = std::max(bounds_max.x, c.x + h);
+                                bounds_max.y = std::max(bounds_max.y, c.y + h);
+                                bounds_max.z = std::max(bounds_max.z, c.z + h);
+                            }
+                        }
+                    }
+
+                    if (!any_child) {
+                        parent.center = core::PlanetPosition{0.0f, 0.0f, 0.0f};
+                        parent.half_size = 0.0f;
+                        parent.min_distance = std::numeric_limits<float>::infinity();
+                        parent.max_distance = 0.0f;
+                        parent.first_child = std::numeric_limits<std::uint32_t>::max();
+                        parent.occupancy_mask = 0;
+                        parent.flags = 0;
+                        parent.reserved = 0;
+                        continue;
+                    }
+
+                    parent.center.x = 0.5f * (bounds_min.x + bounds_max.x);
+                    parent.center.y = 0.5f * (bounds_min.y + bounds_max.y);
+                    parent.center.z = 0.5f * (bounds_min.z + bounds_max.z);
+                    parent.half_size = 0.5f * std::max(
+                        std::max(bounds_max.x - bounds_min.x,
+                                 bounds_max.y - bounds_min.y),
+                        bounds_max.z - bounds_min.z);
+
+                    parent.min_distance = min_abs_dist;
+                    parent.max_distance = max_abs_dist;
+                    parent.first_child = offset_child +
+                        linear_index(dim_child, child_x0, child_y0, child_z0);
+
+                    std::uint8_t occ_mask = 0;
+                    if (any_empty) occ_mask |= kSdfOctreeNodeEmpty;
+                    if (any_solid) occ_mask |= kSdfOctreeNodeSolid;
+                    parent.occupancy_mask = occ_mask;
+
+                    std::uint8_t flags = 0;
+                    if (any_surface || (any_empty && any_solid)) {
+                        flags |= kSdfOctreeNodeHasSurface;
+                    }
+                    parent.flags = flags;
+                    parent.reserved = 0;
+                }
+            }
+        }
+
+        // Shrink the range for the next level up.
+        range_x_min = px_min;
+        range_x_max = px_max;
+        range_y_min = py_min;
+        range_y_max = py_max;
+        range_z_min = pz_min;
+        range_z_max = pz_max;
+    }
 }
 
 float sample_sdf(const SdfGrid& grid,
@@ -1604,9 +1916,9 @@ void update_sdf_region_from_world(const world::World& world,
         }
     }
 
-    // The octree currently mirrors the full dense grid, so when a region is
-    // updated we conservatively rebuild the hierarchy. This can be optimized
-    // later to only touch affected nodes.
+    // Rebuild octree after the region update so GPU users (render + fluid)
+    // see the updated occupancy; this can be optimized to a partial refresh
+    // if needed.
     build_sdf_octree_full(out, out);
 }
 

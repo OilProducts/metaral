@@ -1,6 +1,8 @@
 // Final position update after pressure/viscosity.
 #version 450
 #include "fluid_common.glsl"
+#define SDF_OCTREE_BINDING 14
+#include "sdf_octree.glsl"
 
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
@@ -9,5 +11,39 @@ void main() {
     if (i < 0) return;
     Particle p = positions_out.particles[i];
     p.position.xyz += p.velocity.xyz * params.deltaTime;
+
+    // Collision against SDF if available; fallback to spherical planet.
+    float planetRadius = uFluid.planetParams.x;
+    float damping = uFluid.planetParams.y;
+    float sdf = sample_sdf_octree(p.position.xyz);
+    if (sdf < 0.0) {
+        vec3 n = sample_sdf_normal_octree(p.position.xyz);
+        // Push out of surface by penetration depth (clamped to avoid overshoot).
+        float penetration = clamp(-sdf, 0.0, planetRadius * 0.25);
+        p.position.xyz += n * penetration;
+        float vn = dot(p.velocity.xyz, n);
+        if (vn < 0.0) {
+            // Use damping as (1 - restitution); match CPU path.
+            float impulse_scale = 1.0 + (1.0 - damping);
+            p.velocity.xyz -= n * impulse_scale * vn;
+            p.velocity.xyz *= damping;
+        }
+    } else if (planetRadius > 0.0) {
+        float r = length(p.position.xyz);
+        float penetration = planetRadius - r;
+        if (penetration > 0.0 && r > 0.0) {
+            vec3 n = p.position.xyz / r;
+            // Push particle to the surface.
+            p.position.xyz = n * planetRadius;
+            // Reflect velocity along the normal with damping.
+            float vn = dot(p.velocity.xyz, n);
+            if (vn < 0.0) {
+                float impulse_scale = 1.0 + (1.0 - damping);
+                p.velocity.xyz -= n * impulse_scale * vn;
+                p.velocity.xyz *= damping;
+            }
+        }
+    }
+
     positions_out.particles[i] = p;
 }

@@ -6,6 +6,15 @@
 #include <string>
 #include <vector>
 
+// SDL event support is optional for consumers that don't rely on SDL directly.
+#if __has_include(<SDL3/SDL.h>)
+#define METARAL_HAS_SDL3 1
+#include <SDL3/SDL.h>
+#else
+#define METARAL_HAS_SDL3 0
+struct SDL_Event;
+#endif
+
 #if __has_include(<vulkan/vulkan.h>)
 #include <vulkan/vulkan.h>
 #else
@@ -51,6 +60,9 @@ struct MouseButtonEvent {
 
 struct Event {
     EventType type = EventType::None;
+#if METARAL_HAS_SDL3
+    SDL_Event raw_sdl{}; // raw event for optional higher-level handling (e.g., ImGui)
+#endif
     WindowResizedEvent window_resized{};
     KeyEvent key{};
     MouseMotionEvent mouse_motion{};
@@ -117,6 +129,7 @@ class IApp {
 public:
     virtual ~IApp() = default;
     virtual void on_init(const AppInitContext& ctx) { (void)ctx; }
+    virtual void on_sdl_event(const SDL_Event& ev) { (void)ev; }
     virtual void on_frame(const FrameContext& ctx) = 0;
     virtual void on_shutdown() {}
 };

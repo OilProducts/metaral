@@ -1,0 +1,16 @@
+// Clear the fluid density volume to zero.
+#version 450
+#include "fluid_common.glsl"
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 4) in;
+
+layout(r16f, binding = 8) writeonly uniform image3D fluidVolume;
+
+void main() {
+    uvec3 gid = gl_GlobalInvocationID.xyz;
+    uvec3 dim = uvec3(uFluid.volumeDimIso.xyz);
+    if (any(greaterThanEqual(gid, dim))) {
+        return;
+    }
+    imageStore(fluidVolume, ivec3(gid), vec4(0.0));
+}

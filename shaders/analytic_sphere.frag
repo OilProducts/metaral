@@ -45,6 +45,12 @@ layout(std430, set = 0, binding = 2) readonly buffer SdfOctreeNodes {
     SdfOctreeNode nodes[];
 } uOctree;
 
+layout(set = 0, binding = 3) uniform sampler3D uFluidVolume;
+layout(std140, set = 0, binding = 4) uniform FluidParams {
+    vec4 originAndCell; // xyz = origin, w = cell size
+    vec4 dimAndIso;     // xyz = dim, w = iso threshold
+} uFluid;
+
 const uint SDF_OCTREE_NODE_EMPTY      = 1u << 0;
 const uint SDF_OCTREE_NODE_SOLID      = 1u << 1;
 const uint SDF_OCTREE_NODE_HAS_SURFACE = 1u << 2;
@@ -260,6 +266,37 @@ float sample_sdf(vec3 p) {
     return mix(vy0, vy1, frac.z);
 }
 
+float sample_fluid_density(vec3 p) {
+    vec3 dim = uFluid.dimAndIso.xyz;
+    float cell = uFluid.originAndCell.w;
+    if (cell <= 0.0 ||
+        any(lessThanEqual(dim, vec3(0.0)))) {
+        return 0.0;
+    }
+    vec3 rel = (p - uFluid.originAndCell.xyz) / cell;
+    vec3 uvw = rel / dim;
+    if (any(lessThan(uvw, vec3(0.0))) || any(greaterThan(uvw, vec3(1.0)))) {
+        return 0.0;
+    }
+    return texture(uFluidVolume, uvw).r;
+}
+
+float sample_fluid_phi(vec3 p) {
+    float density = sample_fluid_density(p);
+    if (density <= 0.0) {
+        return 1e6;
+    }
+    return uFluid.dimAndIso.w - density;
+}
+
+vec3 estimate_fluid_normal(vec3 p) {
+    float eps = 0.5 * uCamera.gridVoxelSize;
+    float dx = sample_fluid_phi(p + vec3(eps, 0.0, 0.0)) - sample_fluid_phi(p - vec3(eps, 0.0, 0.0));
+    float dy = sample_fluid_phi(p + vec3(0.0, eps, 0.0)) - sample_fluid_phi(p - vec3(0.0, eps, 0.0));
+    float dz = sample_fluid_phi(p + vec3(0.0, 0.0, eps)) - sample_fluid_phi(p - vec3(0.0, 0.0, eps));
+    return normalize(vec3(dx, dy, dz));
+}
+
 vec3 estimate_normal(vec3 p) {
     float eps = 0.5 * uCamera.gridVoxelSize;
     float dx = sample_sdf(p + vec3(eps, 0.0, 0.0)) - sample_sdf(p - vec3(eps, 0.0, 0.0));
@@ -298,7 +335,7 @@ float calc_ao(vec3 p, vec3 n) {
     return clamp(1.0 - 1.5 * ao, 0.0, 1.0);
 }
 
-bool march_sdf(vec3 ro, vec3 rd, out vec3 hitPos, out vec3 normal) {
+bool march_sdf(vec3 ro, vec3 rd, out vec3 hitPos, out vec3 normal, out bool hitFluid) {
     const int   MAX_STEPS = 192;
     const float SURF_EPS  = 0.01;
     const float MIN_STEP  = 0.01;
@@ -329,6 +366,7 @@ bool march_sdf(vec3 ro, vec3 rd, out vec3 hitPos, out vec3 normal) {
     float bestAbsD = 1e30;
     vec3  bestPos  = ro;
     float bestT    = 0.0;
+    bool  bestFluid = false;
 
     for (int i = 0; i < MAX_STEPS; ++i) {
         if (advance_with_octree(ro, rd, maxDist, t)) {
@@ -339,8 +377,89 @@ bool march_sdf(vec3 ro, vec3 rd, out vec3 hitPos, out vec3 normal) {
         }
 
         vec3 p = ro + rd * t;
-        float d_raw = sample_sdf(p);
-        float d = d_raw - isoOffset;
+        float terrainPhi = sample_sdf(p) - isoOffset;
+        float fluidPhi = sample_fluid_phi(p);
+        float d = terrainPhi;
+        bool currentFluid = false;
+        if (fluidPhi < d) {
+            d = fluidPhi;
+            currentFluid = true;
+        }
+
+        float absD = abs(d);
+        if (absD < bestAbsD) {
+            bestAbsD = absD;
+            bestPos = p;
+            bestT = t;
+            bestFluid = currentFluid;
+        }
+
+        if (d < SURF_EPS) {
+            hitPos = p;
+            normal = estimate_normal(p);
+            hitFluid = currentFluid;
+            return true;
+        }
+
+        float step = max(d * STEP_SAFETY, MIN_STEP);
+        t += step;
+    }
+
+    // Near-miss fallback: if we passed very close to the surface without
+    // formally hitting it, treat the closest approach as a hit. This helps
+    // avoid background pixels at grazing angles.
+    float nearMissEps = max(SURF_EPS * 2.0, 0.25 * uCamera.gridVoxelSize);
+    if (bestAbsD < nearMissEps) {
+        hitPos = bestPos;
+        normal = estimate_normal(bestPos);
+        hitFluid = bestFluid;
+        return true;
+    }
+    hitFluid = false;
+    return false;
+}
+
+// Terrain-only march (ignores fluid field) for transparency compositing.
+bool march_terrain_only(vec3 ro, vec3 rd, out vec3 hitPos, out vec3 normal) {
+    const int   MAX_STEPS = 192;
+    const float SURF_EPS  = 0.01;
+    const float MIN_STEP  = 0.01;
+    const float STEP_SAFETY = 0.8;
+    float isoOffset = uCamera.isoFraction * uCamera.gridVoxelSize;
+
+    float boundaryRadius = uCamera.gridHalfExtent;
+    float maxDist = (boundaryRadius > 0.0) ? boundaryRadius * 2.0 : 1e6;
+
+    float t = 0.0;
+    if (boundaryRadius > 0.0) {
+        float tEnter, tExit;
+        bool hitSphere = ray_sphere_bounds(ro, rd, boundaryRadius, tEnter, tExit);
+        float radiusSq = boundaryRadius * boundaryRadius;
+        float originSq = dot(ro, ro);
+        bool outside = originSq > radiusSq;
+
+        if (outside) {
+            if (!hitSphere || tExit < 0.0) {
+                return false;
+            }
+            t = max(tEnter, 0.0);
+        }
+    }
+
+    float bestAbsD = 1e30;
+    vec3  bestPos  = ro;
+    float bestT    = 0.0;
+
+    for (int i = 0; i < MAX_STEPS; ++i) {
+        if (advance_with_octree(ro, rd, maxDist, t)) {
+            if (t >= maxDist) {
+                break;
+            }
+            continue;
+        }
+
+        vec3 p = ro + rd * t;
+        float d = sample_sdf(p) - isoOffset;
 
         float absD = abs(d);
         if (absD < bestAbsD) {
@@ -359,9 +478,6 @@ bool march_sdf(vec3 ro, vec3 rd, out vec3 hitPos, out vec3 normal) {
         t += step;
     }
 
-    // Near-miss fallback: if we passed very close to the surface without
-    // formally hitting it, treat the closest approach as a hit. This helps
-    // avoid background pixels at grazing angles.
     float nearMissEps = max(SURF_EPS * 2.0, 0.25 * uCamera.gridVoxelSize);
     if (bestAbsD < nearMissEps) {
         hitPos = bestPos;
@@ -371,12 +487,25 @@ bool march_sdf(vec3 ro, vec3 rd, out vec3 hitPos, out vec3 normal) {
     return false;
 }
 
+vec3 shade_terrain(vec3 p, vec3 n, vec3 lightDir, vec3 viewDir, float ndotl) {
+    float height = sample_sdf(p);
+    vec3 albedo = mix(vec3(0.15, 0.12, 0.08), vec3(0.35, 0.28, 0.14), clamp(0.5 + height * 0.4, 0.0, 1.0));
+    float ao = calc_ao(p, n);
+    vec3 ambient = hemisphere_ambient(n) * ao;
+    vec3 diffuse = albedo * ndotl;
+    vec3 color = ambient + diffuse;
+    float fresnel = pow(1.0 - clamp(dot(n, viewDir), 0.0, 1.0), 3.0);
+    color += fresnel * vec3(0.04);
+    return color;
+}
+
 void main() {
     vec3 ro = uCamera.camPos;
     vec3 rd = ray_direction(vUV);
 
     vec3 p, n;
-    if (!march_sdf(ro, rd, p, n)) {
+    bool hitFluid = false;
+    if (!march_sdf(ro, rd, p, n, hitFluid)) {
         outColor = vec4(0.02, 0.04, 0.1, 1.0);
         return;
     }
@@ -384,6 +513,25 @@ void main() {
     vec3 lightDir = normalize(uCamera.sunDirection);
     vec3 viewDir  = normalize(uCamera.camPos - p);
     float ndotl   = max(dot(n, lightDir), 0.0);
+
+    if (hitFluid) {
+        vec3 fluidNormal = estimate_fluid_normal(p);
+        float fluidFresnel = pow(1.0 - clamp(dot(fluidNormal, -rd), 0.0, 1.0), 3.0);
+        float fluidDensity = sample_fluid_density(p);
+        float fluidAlpha = clamp(fluidDensity * 2.0, 0.1, 0.6);
+        vec3 waterColor = vec3(0.1, 0.25, 0.6);
+        vec3 fluidLit = waterColor * (0.2 + 0.8 * max(dot(fluidNormal, lightDir), 0.0));
+        vec3 fluidCol = mix(fluidLit * 0.5, fluidLit, fluidFresnel);
+
+        vec3 terrainPos, terrainNormal;
+        vec3 terrainCol = vec3(0.02, 0.04, 0.1); // sky-ish fallback
+        if (march_terrain_only(p + rd * 0.05, rd, terrainPos, terrainNormal)) {
+            terrainCol = shade_terrain(terrainPos, terrainNormal, lightDir, viewDir, max(dot(terrainNormal, lightDir), 0.0));
+        }
+        vec3 outCol = mix(terrainCol, fluidCol, fluidAlpha);
+        outColor = vec4(outCol, 1.0);
+        return;
+    }
 
     // Use height above the nominal radius (based on the
     // perturbed SDF) to add color variation.

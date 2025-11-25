@@ -76,6 +76,17 @@ struct VulkanRenderer::Impl {
     FluidComputeContext fluid;
     sim::SphParams fluid_params{};
     uint32_t fluid_particle_count = 0;
+    VkImage fluid_volume_image = VK_NULL_HANDLE;
+    VkDeviceMemory fluid_volume_memory = VK_NULL_HANDLE;
+    VkImageView fluid_volume_view = VK_NULL_HANDLE;
+    VkSampler fluid_volume_sampler = VK_NULL_HANDLE;
+    VkExtent3D fluid_volume_extent{128, 128, 64};
+    float fluid_cell_size = 0.25f;
+    core::PlanetPosition fluid_origin{};
+    float fluid_iso = 0.5f;
+    VkImageLayout fluid_volume_layout = VK_IMAGE_LAYOUT_UNDEFINED;
+    VkBuffer fluid_params_buffer = VK_NULL_HANDLE;
+    VkDeviceMemory fluid_params_memory = VK_NULL_HANDLE;
 };
 
 namespace {
@@ -351,7 +362,7 @@ std::vector<char> read_file(const char* path) {
     long size = std::ftell(f);
     std::fseek(f, 0, SEEK_SET);
     std::vector<char> data(static_cast<std::size_t>(size));
-    std::fread(data.data(), 1, data.size(), f);
+    (void)std::fread(data.data(), 1, data.size(), f);
     std::fclose(f);
     return data;
 }
@@ -402,7 +413,7 @@ struct alignas(16) GpuSdfOctreeNode {
 static_assert(sizeof(GpuSdfOctreeNode) == 48, "GpuSdfOctreeNode size must match GLSL layout");
 
 void create_pipeline(Impl& impl) {
-    VkDescriptorSetLayoutBinding bindings[3]{};
+    VkDescriptorSetLayoutBinding bindings[5]{};
 
     // binding 0: SDF buffer
     bindings[0].binding = 0;
@@ -422,9 +433,21 @@ void create_pipeline(Impl& impl) {
     bindings[2].descriptorCount = 1;
     bindings[2].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
 
+    // binding 3: fluid density volume
+    bindings[3].binding = 3;
+    bindings[3].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    bindings[3].descriptorCount = 1;
+    bindings[3].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+
+    // binding 4: fluid params uniform
+    bindings[4].binding = 4;
+    bindings[4].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    bindings[4].descriptorCount = 1;
+    bindings[4].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+
     VkDescriptorSetLayoutCreateInfo set_layout_info{};
     set_layout_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    set_layout_info.bindingCount = 3;
+    set_layout_info.bindingCount = 5;
     set_layout_info.pBindings = bindings;
 
     vk_check(vkCreateDescriptorSetLayout(impl.device,
@@ -528,6 +551,132 @@ void create_pipeline(Impl& impl) {
     vkDestroyShaderModule(impl.device, frag, nullptr);
 }
 
+void destroy_fluid_volume(Impl& impl) {
+    if (impl.device == VK_NULL_HANDLE) {
+        return;
+    }
+    if (impl.fluid_params_buffer != VK_NULL_HANDLE) {
+        vkDestroyBuffer(impl.device, impl.fluid_params_buffer, nullptr);
+        impl.fluid_params_buffer = VK_NULL_HANDLE;
+    }
+    if (impl.fluid_params_memory != VK_NULL_HANDLE) {
+        vkFreeMemory(impl.device, impl.fluid_params_memory, nullptr);
+        impl.fluid_params_memory = VK_NULL_HANDLE;
+    }
+    if (impl.fluid_volume_sampler != VK_NULL_HANDLE) {
+        vkDestroySampler(impl.device, impl.fluid_volume_sampler, nullptr);
+        impl.fluid_volume_sampler = VK_NULL_HANDLE;
+    }
+    if (impl.fluid_volume_view != VK_NULL_HANDLE) {
+        vkDestroyImageView(impl.device, impl.fluid_volume_view, nullptr);
+        impl.fluid_volume_view = VK_NULL_HANDLE;
+    }
+    if (impl.fluid_volume_image != VK_NULL_HANDLE) {
+        vkDestroyImage(impl.device, impl.fluid_volume_image, nullptr);
+        impl.fluid_volume_image = VK_NULL_HANDLE;
+    }
+    if (impl.fluid_volume_memory != VK_NULL_HANDLE) {
+        vkFreeMemory(impl.device, impl.fluid_volume_memory, nullptr);
+        impl.fluid_volume_memory = VK_NULL_HANDLE;
+    }
+    impl.fluid_volume_layout = VK_IMAGE_LAYOUT_UNDEFINED;
+    impl.fluid.set_density_image(VK_NULL_HANDLE, VK_NULL_HANDLE);
+}
+
+void ensure_fluid_volume(Impl& impl) {
+    if (impl.device == VK_NULL_HANDLE || impl.fluid_volume_image != VK_NULL_HANDLE) {
+        return;
+    }
+
+    VkExtent3D extent = impl.fluid_volume_extent;
+    if (extent.width == 0 || extent.height == 0 || extent.depth == 0) {
+        extent = {128, 128, 64};
+        impl.fluid_volume_extent = extent;
+    }
+
+    VkImageCreateInfo img{};
+    img.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+    img.imageType = VK_IMAGE_TYPE_3D;
+    img.extent = extent;
+    img.mipLevels = 1;
+    img.arrayLayers = 1;
+    img.format = VK_FORMAT_R16_SFLOAT;
+    img.tiling = VK_IMAGE_TILING_OPTIMAL;
+    img.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    img.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+    img.samples = VK_SAMPLE_COUNT_1_BIT;
+    img.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+
+    vk_check(vkCreateImage(impl.device, &img, nullptr, &impl.fluid_volume_image),
+             "vkCreateImage(fluid_volume_image)");
+
+    VkMemoryRequirements req{};
+    vkGetImageMemoryRequirements(impl.device, impl.fluid_volume_image, &req);
+
+    VkMemoryAllocateInfo alloc{};
+    alloc.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    alloc.allocationSize = req.size;
+    alloc.memoryTypeIndex = find_memory_type(
+        impl, req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+
+    vk_check(vkAllocateMemory(impl.device, &alloc, nullptr, &impl.fluid_volume_memory),
+             "vkAllocateMemory(fluid_volume_memory)");
+    vk_check(vkBindImageMemory(impl.device, impl.fluid_volume_image, impl.fluid_volume_memory, 0),
+             "vkBindImageMemory(fluid_volume_image)");
+
+    VkImageViewCreateInfo view{};
+    view.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+    view.image = impl.fluid_volume_image;
+    view.viewType = VK_IMAGE_VIEW_TYPE_3D;
+    view.format = VK_FORMAT_R16_SFLOAT;
+    view.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    view.subresourceRange.baseMipLevel = 0;
+    view.subresourceRange.levelCount = 1;
+    view.subresourceRange.baseArrayLayer = 0;
+    view.subresourceRange.layerCount = 1;
+    vk_check(vkCreateImageView(impl.device, &view, nullptr, &impl.fluid_volume_view),
+             "vkCreateImageView(fluid_volume_view)");
+
+    VkSamplerCreateInfo samp{};
+    samp.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+    samp.magFilter = VK_FILTER_LINEAR;
+    samp.minFilter = VK_FILTER_LINEAR;
+    samp.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+    samp.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    samp.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    samp.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    samp.minLod = 0.0f;
+    samp.maxLod = 0.0f;
+    vk_check(vkCreateSampler(impl.device, &samp, nullptr, &impl.fluid_volume_sampler),
+             "vkCreateSampler(fluid_volume_sampler)");
+
+    impl.fluid_volume_layout = VK_IMAGE_LAYOUT_UNDEFINED;
+    impl.fluid.set_density_image(impl.fluid_volume_image, impl.fluid_volume_view);
+
+    // Allocate a small uniform buffer for fluid params (two vec4).
+    VkBufferCreateInfo buf{};
+    buf.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+    buf.size = sizeof(float) * 8;
+    buf.usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT;
+    buf.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    vk_check(vkCreateBuffer(impl.device, &buf, nullptr, &impl.fluid_params_buffer),
+             "vkCreateBuffer(fluid_params_buffer)");
+
+    VkMemoryRequirements bufReq{};
+    vkGetBufferMemoryRequirements(impl.device, impl.fluid_params_buffer, &bufReq);
+
+    VkMemoryAllocateInfo bufAlloc{};
+    bufAlloc.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    bufAlloc.allocationSize = bufReq.size;
+    bufAlloc.memoryTypeIndex = find_memory_type(
+        impl, bufReq.memoryTypeBits,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    vk_check(vkAllocateMemory(impl.device, &bufAlloc, nullptr, &impl.fluid_params_memory),
+             "vkAllocateMemory(fluid_params_memory)");
+    vk_check(vkBindBufferMemory(impl.device, impl.fluid_params_buffer, impl.fluid_params_memory, 0),
+             "vkBindBufferMemory(fluid_params_buffer)");
+}
+
 void ensure_sdf_grid(Impl& impl,
                      const world::World& world,
                      const core::CoordinateConfig& cfg,
@@ -541,10 +690,13 @@ void ensure_sdf_grid(Impl& impl,
         impl.sdf_dim == 0 ||
         impl.sdf_voxel_size <= 0.0f ||
         impl.sdf_radius != cfg.planet_radius_m;
+    const bool need_descriptor_update =
+        impl.descriptor_set == VK_NULL_HANDLE ||
+        (impl.fluid_volume_view != VK_NULL_HANDLE && impl.fluid_volume_sampler != VK_NULL_HANDLE);
 
-    // If no full rebuild is needed and there's no dirty region, the grid and
-    // GPU buffers are already up-to-date.
-    if (!needs_full_rebuild && !impl.sdf_dirty) {
+    // If no full rebuild is needed, there's no dirty region, and descriptors
+    // are already valid, nothing to do.
+    if (!needs_full_rebuild && !impl.sdf_dirty && !need_descriptor_update) {
         return;
     }
 
@@ -558,9 +710,11 @@ void ensure_sdf_grid(Impl& impl,
         impl.sdf_dirty = false;
     }
 
-    const std::size_t sdf_bytes =
+    const std::size_t sdf_bytes_raw =
         impl.sdf_grid.values.size() * sizeof(float);
-    const std::size_t mat_count = impl.sdf_grid.materials.size();
+    const std::size_t sdf_bytes = std::max<std::size_t>(sdf_bytes_raw, sizeof(float));
+    const std::size_t mat_count_raw = impl.sdf_grid.materials.size();
+    const std::size_t mat_count = std::max<std::size_t>(mat_count_raw, 1);
 
     // Cache octree metadata from the CPU grid. If the octree is unavailable or
     // failed to build, we simply leave the node count at zero and the shader
@@ -669,46 +823,54 @@ void ensure_sdf_grid(Impl& impl,
                  "vkBindBufferMemory(sdf_octree_buffer)");
     }
 
-    void* mapped_sdf = nullptr;
-    vk_check(vkMapMemory(impl.device,
-                         impl.sdf_memory,
-                         0,
-                         sdf_bytes,
-                         0,
-                         &mapped_sdf),
-             "vkMapMemory(sdf_memory)");
-    float* sdf_gpu = static_cast<float*>(mapped_sdf);
-
-    void* mapped_mat = nullptr;
-    vk_check(vkMapMemory(impl.device,
-                         impl.material_memory,
-                         0,
-                         mat_count * sizeof(std::uint32_t),
-                         0,
-                         &mapped_mat),
-             "vkMapMemory(material_memory)");
-    auto* mat_gpu = static_cast<std::uint32_t*>(mapped_mat);
-
+    float* sdf_gpu = nullptr;
+    std::uint32_t* mat_gpu = nullptr;
     GpuSdfOctreeNode* octree_gpu = nullptr;
-    if (impl.sdf_octree_node_count > 0) {
-        void* mapped_oct = nullptr;
+    if (needs_full_rebuild || impl.sdf_dirty) {
+        void* mapped_sdf = nullptr;
         vk_check(vkMapMemory(impl.device,
-                             impl.sdf_octree_memory,
+                             impl.sdf_memory,
                              0,
-                             octree_bytes,
+                             sdf_bytes,
                              0,
-                             &mapped_oct),
-                 "vkMapMemory(sdf_octree_memory)");
-        octree_gpu = static_cast<GpuSdfOctreeNode*>(mapped_oct);
+                             &mapped_sdf),
+                 "vkMapMemory(sdf_memory)");
+        sdf_gpu = static_cast<float*>(mapped_sdf);
+
+        void* mapped_mat = nullptr;
+        vk_check(vkMapMemory(impl.device,
+                             impl.material_memory,
+                             0,
+                             mat_count * sizeof(std::uint32_t),
+                             0,
+                             &mapped_mat),
+                 "vkMapMemory(material_memory)");
+        mat_gpu = static_cast<std::uint32_t*>(mapped_mat);
+
+        if (impl.sdf_octree_node_count > 0) {
+            void* mapped_oct = nullptr;
+            vk_check(vkMapMemory(impl.device,
+                                 impl.sdf_octree_memory,
+                                 0,
+                                 octree_bytes,
+                                 0,
+                                 &mapped_oct),
+                     "vkMapMemory(sdf_octree_memory)");
+            octree_gpu = static_cast<GpuSdfOctreeNode*>(mapped_oct);
+        }
     }
 
-    if (needs_full_rebuild) {
+    if (needs_full_rebuild && sdf_gpu && mat_gpu) {
         // Full rebuild: mirror the entire CPU grid into the GPU buffers.
-        for (std::size_t idx = 0; idx < impl.sdf_grid.values.size(); ++idx) {
+        const std::size_t val_count = impl.sdf_grid.values.size();
+        for (std::size_t idx = 0; idx < val_count; ++idx) {
             sdf_gpu[idx] = impl.sdf_grid.values[idx];
+        }
+        const std::size_t mat_count_copy = impl.sdf_grid.materials.size();
+        for (std::size_t idx = 0; idx < mat_count_copy; ++idx) {
             mat_gpu[idx] = static_cast<std::uint32_t>(impl.sdf_grid.materials[idx]);
         }
-    } else if (impl.sdf_dirty) {
+    } else if (impl.sdf_dirty && sdf_gpu && mat_gpu) {
         // Incremental update: only touch samples inside the dirty world-space
         // AABB, updating both CPU grid and GPU buffers.
         update_sdf_region_from_world(world,
@@ -725,6 +887,8 @@ void ensure_sdf_grid(Impl& impl,
     if (octree_gpu &&
         impl.sdf_grid.has_octree &&
         impl.sdf_octree_node_count <= impl.sdf_grid.octree.nodes.size()) {
+        // Upload the entire octree whenever the CPU copy changes; incremental
+        // updates are already limited to dirty regions.
         for (std::uint32_t i = 0; i < impl.sdf_octree_node_count; ++i) {
             const SdfOctreeNode& src = impl.sdf_grid.octree.nodes[i];
             GpuSdfOctreeNode& dst = octree_gpu[i];
@@ -743,8 +907,12 @@ void ensure_sdf_grid(Impl& impl,
         }
     }
 
-    vkUnmapMemory(impl.device, impl.sdf_memory);
-    vkUnmapMemory(impl.device, impl.material_memory);
+    if (sdf_gpu) {
+        vkUnmapMemory(impl.device, impl.sdf_memory);
+    }
+    if (mat_gpu) {
+        vkUnmapMemory(impl.device, impl.material_memory);
+    }
     if (octree_gpu) {
         vkUnmapMemory(impl.device, impl.sdf_octree_memory);
     }
@@ -755,15 +923,19 @@ void ensure_sdf_grid(Impl& impl,
     impl.sdf_half_extent = impl.sdf_grid.half_extent;
 
     if (impl.descriptor_pool == VK_NULL_HANDLE) {
-        VkDescriptorPoolSize pool_size{};
-        pool_size.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-        pool_size.descriptorCount = 3;
+        VkDescriptorPoolSize pool_sizes[3]{};
+        pool_sizes[0].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        pool_sizes[0].descriptorCount = 3;
+        pool_sizes[1].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        pool_sizes[1].descriptorCount = 1;
+        pool_sizes[2].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        pool_sizes[2].descriptorCount = 1;
 
         VkDescriptorPoolCreateInfo pool_info{};
         pool_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
         pool_info.maxSets = 1;
-        pool_info.poolSizeCount = 1;
-        pool_info.pPoolSizes = &pool_size;
+        pool_info.poolSizeCount = 3;
+        pool_info.pPoolSizes = pool_sizes;
 
         vk_check(vkCreateDescriptorPool(impl.device, &pool_info, nullptr, &impl.descriptor_pool),
                  "vkCreateDescriptorPool");
@@ -779,6 +951,9 @@ void ensure_sdf_grid(Impl& impl,
         vk_check(vkAllocateDescriptorSets(impl.device, &alloc_set, &impl.descriptor_set),
                  "vkAllocateDescriptorSets");
     }
+    if (impl.descriptor_set == VK_NULL_HANDLE) {
+        return;
+    }
 
     VkDescriptorBufferInfo sdf_desc{};
     sdf_desc.buffer = impl.sdf_buffer;
@@ -793,35 +968,70 @@ void ensure_sdf_grid(Impl& impl,
     VkDescriptorBufferInfo octree_desc{};
     octree_desc.buffer = impl.sdf_octree_buffer;
     octree_desc.offset = 0;
-    octree_desc.range = octree_bytes;
+    octree_desc.range = octree_bytes > 0 ? octree_bytes : sizeof(GpuSdfOctreeNode);
 
-    VkWriteDescriptorSet writes[3]{};
+    std::vector<VkWriteDescriptorSet> writes;
+    writes.reserve(5);
 
-    writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    writes[0].dstSet = impl.descriptor_set;
-    writes[0].dstBinding = 0;
-    writes[0].dstArrayElement = 0;
-    writes[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    writes[0].descriptorCount = 1;
-    writes[0].pBufferInfo = &sdf_desc;
+    auto push_buffer_write = [&](uint32_t binding, VkDescriptorBufferInfo* info) {
+        if (!info || info->buffer == VK_NULL_HANDLE || info->range == 0) {
+            return;
+        }
+        VkWriteDescriptorSet w{};
+        w.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        w.dstSet = impl.descriptor_set;
+        w.dstBinding = binding;
+        w.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        w.descriptorCount = 1;
+        w.pBufferInfo = info;
+        writes.push_back(w);
+    };
 
-    writes[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    writes[1].dstSet = impl.descriptor_set;
-    writes[1].dstBinding = 1;
-    writes[1].dstArrayElement = 0;
-    writes[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    writes[1].descriptorCount = 1;
-    writes[1].pBufferInfo = &mat_desc;
+    push_buffer_write(0, &sdf_desc);
+    push_buffer_write(1, &mat_desc);
+    push_buffer_write(2, &octree_desc);
 
-    writes[2].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    writes[2].dstSet = impl.descriptor_set;
-    writes[2].dstBinding = 2;
-    writes[2].dstArrayElement = 0;
-    writes[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    writes[2].descriptorCount = 1;
-    writes[2].pBufferInfo = &octree_desc;
+    if (impl.fluid_volume_view != VK_NULL_HANDLE &&
+        impl.fluid_volume_sampler != VK_NULL_HANDLE &&
+        impl.fluid_params_buffer != VK_NULL_HANDLE) {
+        VkDescriptorImageInfo fluid_img{};
+        fluid_img.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+        fluid_img.imageView = impl.fluid_volume_view;
+        fluid_img.sampler = impl.fluid_volume_sampler;
 
-    vkUpdateDescriptorSets(impl.device, 3, writes, 0, nullptr);
+        VkWriteDescriptorSet wf{};
+        wf.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        wf.dstSet = impl.descriptor_set;
+        wf.dstBinding = 3;
+        wf.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        wf.descriptorCount = 1;
+        wf.pImageInfo = &fluid_img;
+        writes.push_back(wf);
+
+        VkDescriptorBufferInfo fluid_params_desc{};
+        fluid_params_desc.buffer = impl.fluid_params_buffer;
+        fluid_params_desc.offset = 0;
+        fluid_params_desc.range = sizeof(float) * 8; // two vec4
+
+        if (fluid_params_desc.buffer != VK_NULL_HANDLE && fluid_params_desc.range > 0) {
+            VkWriteDescriptorSet wfParams{};
+            wfParams.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            wfParams.dstSet = impl.descriptor_set;
+            wfParams.dstBinding = 4;
+            wfParams.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+            wfParams.descriptorCount = 1;
+            wfParams.pBufferInfo = &fluid_params_desc;
+            writes.push_back(wfParams);
+        }
+    }
+
+    if (!writes.empty()) {
+        vkUpdateDescriptorSets(impl.device,
+                               static_cast<uint32_t>(writes.size()),
+                               writes.data(),
+                               0,
+                               nullptr);
+    }
 }
 
 void create_command_pool_and_buffers(Impl& impl) {
@@ -957,6 +1167,7 @@ VulkanRenderer::~VulkanRenderer() {
     }
 
     // Fluid resources
+    destroy_fluid_volume(*impl_);
     impl_->fluid = FluidComputeContext{};
     if (impl_->descriptor_set_layout != VK_NULL_HANDLE) {
         vkDestroyDescriptorSetLayout(impl_->device, impl_->descriptor_set_layout, nullptr);
@@ -1038,7 +1249,7 @@ core::PlanetPosition cross_vec(const core::PlanetPosition& a, const core::Planet
     };
 }
 
-void VulkanRenderer::draw_frame(const Camera& camera, const world::World& world) {
+void VulkanRenderer::draw_frame(const Camera& camera, const world::World& world, float dt_seconds) {
     if (impl_->device == VK_NULL_HANDLE || impl_->swapchain == VK_NULL_HANDLE) {
         return;
     }
@@ -1065,6 +1276,7 @@ void VulkanRenderer::draw_frame(const Camera& camera, const world::World& world)
         impl_->sdf_dim == 0 ||
         impl_->sdf_voxel_size <= 0.0f ||
         impl_->sdf_radius != world.coords().planet_radius_m;
+    ensure_fluid_volume(*impl_);
     ensure_sdf_grid(*impl_, world, world.coords(), force_rebuild);
 
     // Build push constants for this frame
@@ -1125,6 +1337,52 @@ void VulkanRenderer::draw_frame(const Camera& camera, const world::World& world)
     push.octreeEnabled =
         (impl_->sdf_octree_node_count > 0 && impl_->sdf_grid.has_octree) ? 1.0f : 0.0f;
 
+    impl_->fluid_cell_size = (impl_->sdf_voxel_size > 0.0f) ? impl_->sdf_voxel_size : 0.25f;
+    const float spanX = impl_->fluid_cell_size * static_cast<float>(impl_->fluid_volume_extent.width);
+    const float spanY = impl_->fluid_cell_size * static_cast<float>(impl_->fluid_volume_extent.height);
+    const float spanZ = impl_->fluid_cell_size * static_cast<float>(impl_->fluid_volume_extent.depth);
+    impl_->fluid_origin = {
+        camera.position.x - 0.5f * spanX,
+        camera.position.y - 0.5f * spanY,
+        camera.position.z - 0.5f * spanZ,
+    };
+    impl_->fluid_iso = 0.5f;
+
+    FluidVolumeParams volume_params{};
+    volume_params.origin = impl_->fluid_origin;
+    volume_params.cell_size = impl_->fluid_cell_size;
+    volume_params.dim_x = impl_->fluid_volume_extent.width;
+    volume_params.dim_y = impl_->fluid_volume_extent.height;
+    volume_params.dim_z = impl_->fluid_volume_extent.depth;
+    volume_params.iso_threshold = impl_->fluid_iso;
+    volume_params.planet_radius = world.coords().planet_radius_m;
+    if (impl_->fluid_particle_count == 0) {
+        volume_params.dim_x = 0;
+        volume_params.dim_y = 0;
+        volume_params.dim_z = 0;
+    }
+
+    if (impl_->fluid_params_buffer != VK_NULL_HANDLE) {
+        struct FluidParamsGpu {
+            float originCell[4];
+            float dimIso[4];
+        } params{};
+        params.originCell[0] = impl_->fluid_origin.x;
+        params.originCell[1] = impl_->fluid_origin.y;
+        params.originCell[2] = impl_->fluid_origin.z;
+        params.originCell[3] = impl_->fluid_cell_size;
+        params.dimIso[0] = static_cast<float>(volume_params.dim_x);
+        params.dimIso[1] = static_cast<float>(volume_params.dim_y);
+        params.dimIso[2] = static_cast<float>(volume_params.dim_z);
+        params.dimIso[3] = impl_->fluid_iso;
+
+        void* mapped = nullptr;
+        vk_check(vkMapMemory(impl_->device, impl_->fluid_params_memory, 0, sizeof(FluidParamsGpu), 0, &mapped),
+                 "vkMapMemory(fluid_params)");
+        std::memcpy(mapped, &params, sizeof(FluidParamsGpu));
+        vkUnmapMemory(impl_->device, impl_->fluid_params_memory);
+    }
+
     // Record command buffer for this image
     VkCommandBuffer cmd = impl_->command_buffers[image_index];
     vk_check(vkResetCommandBuffer(cmd, 0), "vkResetCommandBuffer");
@@ -1134,11 +1392,80 @@ void VulkanRenderer::draw_frame(const Camera& camera, const world::World& world)
     vk_check(vkBeginCommandBuffer(cmd, &begin_info), "vkBeginCommandBuffer");
 
     // Compute pass: run fluid step before the render pass.
+    if (impl_->fluid_volume_image != VK_NULL_HANDLE &&
+        impl_->fluid_volume_layout != VK_IMAGE_LAYOUT_GENERAL) {
+        VkImageMemoryBarrier layout_barrier{};
+        layout_barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        layout_barrier.oldLayout = impl_->fluid_volume_layout;
+        layout_barrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+        layout_barrier.srcAccessMask = 0;
+        layout_barrier.dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        layout_barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        layout_barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        layout_barrier.image = impl_->fluid_volume_image;
+        layout_barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        layout_barrier.subresourceRange.baseMipLevel = 0;
+        layout_barrier.subresourceRange.levelCount = 1;
+        layout_barrier.subresourceRange.baseArrayLayer = 0;
+        layout_barrier.subresourceRange.layerCount = 1;
+        vkCmdPipelineBarrier(cmd,
+                             VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                             0,
+                             0, nullptr,
+                             0, nullptr,
+                             1, &layout_barrier);
+        impl_->fluid_volume_layout = VK_IMAGE_LAYOUT_GENERAL;
+    }
+
     if (fluid_ready && impl_->fluid_particle_count > 0) {
+        if (impl_->sdf_buffer != VK_NULL_HANDLE && impl_->sdf_dim > 0) {
+            impl_->fluid.set_sdf_buffer(impl_->sdf_buffer,
+                                        impl_->sdf_dim,
+                                        impl_->sdf_voxel_size,
+                                        impl_->sdf_half_extent,
+                                        impl_->sdf_radius);
+        } else {
+            impl_->fluid.set_sdf_buffer(VK_NULL_HANDLE, 0, 0.0f, 0.0f, impl_->sdf_radius);
+        }
+        if (impl_->sdf_octree_buffer != VK_NULL_HANDLE &&
+            impl_->sdf_octree_node_count > 0 &&
+            impl_->sdf_grid.has_octree) {
+            impl_->fluid.set_sdf_octree(impl_->sdf_octree_buffer,
+                                        impl_->sdf_octree_node_count,
+                                        impl_->sdf_octree_root_index,
+                                        impl_->sdf_octree_depth);
+        } else {
+            impl_->fluid.set_sdf_octree(VK_NULL_HANDLE, 0, 0, 0);
+        }
         impl_->fluid.step(cmd,
-                          1.0f / 60.0f, // TODO: feed actual frame dt
+                          dt_seconds,
                           impl_->fluid_params,
-                          impl_->fluid_particle_count);
+                          impl_->fluid_particle_count,
+                          volume_params);
+    }
+    if (fluid_ready && impl_->fluid_particle_count > 0 && impl_->fluid_volume_image != VK_NULL_HANDLE) {
+        VkImageMemoryBarrier to_read{};
+        to_read.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        to_read.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+        to_read.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+        to_read.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        to_read.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        to_read.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        to_read.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        to_read.image = impl_->fluid_volume_image;
+        to_read.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        to_read.subresourceRange.baseMipLevel = 0;
+        to_read.subresourceRange.levelCount = 1;
+        to_read.subresourceRange.baseArrayLayer = 0;
+        to_read.subresourceRange.layerCount = 1;
+        vkCmdPipelineBarrier(cmd,
+                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                             VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                             0,
+                             0, nullptr,
+                             0, nullptr,
+                             1, &to_read);
     }
 
     VkClearValue clear_color{};
